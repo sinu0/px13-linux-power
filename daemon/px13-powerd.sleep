@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+case "$1" in
+    pre)
+        /usr/local/bin/px13ctl prepare-suspend >/dev/null 2>&1
+        ;;
+    post)
+        /usr/local/bin/px13ctl resume-after-sleep >/dev/null 2>&1
+        ;;
+esac

@@ -1,0 +1,7 @@
+This repository contains code under multiple licenses:
+
+- module/: GPL-2.0-only
+- daemon/, scripts/, install.sh, uninstall.sh and nvpcf-override/: MIT
+- rcc/*.patch: MPL-2.0
+
+See LICENSES/ for the full license texts and each source file's SPDX header.

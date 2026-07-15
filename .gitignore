@@ -1,0 +1,11 @@
+*.ko
+*.mod
+*.mod.c
+*.o
+*.so
+/.cache/
+/module/Module.symvers
+/module/modules.order
+/module/.*.cmd
+/nvpcf-override/libnvpcf_override.so
+__pycache__/

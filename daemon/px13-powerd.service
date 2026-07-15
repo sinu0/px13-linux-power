@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=ASUS ProArt PX13 power profile controller
+After=asusd.service systemd-modules-load.service
+Before=nvidia-powerd.service
+Wants=asusd.service nvidia-powerd.service
+# A package update can replace the modules of the still-running kernel.  Do
+# not restart the controller into a broken state; the DKMS hook has already
+# prepared the module for the kernel selected at the next boot.
+ConditionPathExistsGlob=/usr/lib/modules/%v/updates/dkms/px13_tgp_probe.ko*
+ConditionPathExists=/sys/module/px13_tgp_probe
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=dbus
+BusName=org.asuslinux.Px13Power
+ExecStart=/usr/local/lib/px13-powerd/px13_powerd.py
+Restart=on-failure
+RestartSec=2
+StateDirectory=px13-powerd
+RuntimeDirectory=px13-powerd
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+PrivateTmp=true
+PrivateIPC=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+IPAddressDeny=any
+UMask=0077
+# GPU offsets discover the current Xwayland authority file at request time.
+# Bind the runtime parent optionally: a user session does not exist during
+# early boot, while a fixed /run/user/1000 path makes the service fail.
+ProtectHome=tmpfs
+BindReadOnlyPaths=-/run/user
+ProtectSystem=strict
+ReadWritePaths=/sys/module/px13_tgp_probe/parameters /sys/devices/system/cpu/cpufreq /var/lib/px13-powerd /run/px13-powerd
+
+[Install]
+WantedBy=multi-user.target
