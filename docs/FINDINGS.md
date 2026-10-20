@@ -202,3 +202,27 @@ Re-tested on kernel `7.3.0-rc1` (CachyOS), NVIDIA `610.57.04`, `asusctl`
   `rcc/` was ported to `asusctl` 6.4.0; the only required change was that
   the `init_property!`/`setup_external!` macros in 6.4.0 no longer take a
   type argument.
+
+## 2026-10 deep discharge on USB-C
+
+- With the quiet mode selected on battery, the 0.2.0 development daemon ran
+  Quiet Gaming (EPP `balance_performance`) on battery and drained it to
+  0 %. The firmware reported `AC0` online and `Charging` with a positive
+  `power_now` on the USB-C charger the whole time, so the desktop's
+  low-battery action never triggered. At 0 % the gauge reads 0 Wh, which
+  also blinded the battery balance controller.
+- The embedded controller then latched two limits at once. Under load the
+  CPU stayed at about 606 MHz with Gaming PPT (30/45/55 W), full CPPC limits
+  and `amd_pstate` active, so the throttling came from the firmware. On the
+  user's usual 150 W charger and cable the battery lost about 12 W (stored
+  energy 15.09 → 14.68 Wh in 2 minutes) while the firmware reported +8..17 W.
+- A normal reboot cleared the CPU throttling but not the input limit. An EC
+  reset (power off, unplug, hold the power button for 30-40 s) cleared it:
+  the same charger and cable then charged at +72 W measured from the stored
+  energy, matching the firmware's +70 W.
+- The kernel received no PD source capabilities from the UCSI firmware, and
+  its VBUS voltage and current readings stay at 0, so the negotiated contract
+  could not be read.
+- The daemon now runs Quiet Gaming with EPP `power` on battery, follows the
+  battery voltage trend while the gauge reads empty, and reports when the
+  battery drains even at the lowest limits on external power.

@@ -178,9 +178,12 @@ trendem napięcia baterii i trzyma najniższy poziom, dopóki napięcie spada.
 Jeśli bateria traci energię nawet na najniższym poziomie, linia statusu
 informuje, że ładowarka nie pokrywa poboru. Warto to traktować poważnie:
 firmware dalej zgłasza zasilanie zewnętrzne i „Charging”, więc pulpit nie
-uśpi ani nie wyłączy laptopa przy niskiej baterii, a głębokie rozładowanie na
-słabej ładowarce USB-C zatrzasnęło kontroler EC w dławieniu CPU do ok. 600
-MHz aż do restartu.
+uśpi ani nie wyłączy laptopa przy niskiej baterii. Po takim głębokim
+rozładowaniu na USB-C kontroler EC zatrzasnął się w dławieniu CPU do ok. 600
+MHz i ograniczaniu poboru z USB-C; restart zdjął dławienie, ale ładowanie
+przywrócił dopiero reset EC (wyłączenie, odłączenie zasilania, przytrzymanie
+przycisku zasilania przez 30-40 s). Szczegóły w
+[`docs/FINDINGS.md`](docs/FINDINGS.md).
 
 `px13ctl state` pokazuje regulator pod kluczem `battery_balance`
 (`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`,
