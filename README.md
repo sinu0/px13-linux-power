@@ -32,7 +32,7 @@ a custom VBIOS.
 On Arch Linux, install the prerequisites first:
 
 ```bash
-sudo pacman -S --needed base-devel dkms python-dbus python-gobject nvidia-utils asusctl
+sudo pacman -S --needed base-devel dkms python-dbus python-gobject python-nvidia-ml-py nvidia-utils asusctl
 sudo pacman -S --needed "$(cat /usr/lib/modules/$(uname -r)/pkgbase)-headers"
 git clone https://github.com/sinu0/px13-linux-power.git
 cd px13-linux-power
@@ -79,41 +79,51 @@ initramfs/reboot note.
 
 ## Use
 
+The limits follow the platform profile, like the modes of G-Helper: switch it
+with Fn+F5, the profile list in ROG Control Center or `asusctl profile set`,
+and asusd's own switching on AC and battery (Throttle policy on AC/battery in
+ROG Control Center) switches the limits too.
+
 ```bash
-px13ctl state
-px13ctl capabilities
-px13ctl activate "Quiet Gaming"
-px13ctl activate Gaming
+px13ctl state            # mode, profile, limits, telemetry
+px13ctl capabilities     # modes and the ranges that can be tuned
 px13ctl reset            # drop manual changes of the active profile
-px13ctl default          # back to Safe
+px13ctl confirm-cooling
 sudo ./scripts/doctor.sh
 ```
 
-### Profiles
+### Modes and profiles
 
-The stock profiles live in the model file
-[`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml):
+The model file [`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml)
+lists, for each mode, the profiles it may use. The first one whose
+requirements hold is applied; when none does, Safe is.
 
-- **Safe** is the default. It is applied at startup, before suspend and
-  whenever the conditions of another profile stop holding.
-- **Quiet Gaming** keeps the ASUS Quiet fan profile and the Safe GPU WMI
-  envelope, and starts the CPU at PPT 15/20/25 W with the
-  `balance_performance` EPP. It works on battery and is restored after
-  suspend/resume and daemon restarts.
-- **Gaming** requires external power.
+| Mode        | Profile      | Notes                                                    |
+| ----------- | ------------ | -------------------------------------------------------- |
+| quiet       | Quiet Gaming | Safe GPU envelope, CPU PPT 15/20/25 W, battery balance    |
+| balanced    | Safe         | EPP `balance_power`, `power` on battery                  |
+| performance | Gaming       | requires external power                                  |
 
-Manual CPU/GPU/clock tuning (ROG Control Center sliders) is possible in any
-profile except Safe, on external power. Changes are kept per profile;
-`px13ctl reset` drops them. Profiles never overclock on their own.
+The daemon re-evaluates whenever the mode, the power source, the lid or the
+cooling confirmation changes: unplugging in the performance mode switches to
+Safe, and plugging back in returns to Gaming. Safe is also held while the
+system suspends and when the service stops.
+
+Manual CPU/GPU/clock tuning (ROG Control Center sliders) works in every
+profile except Safe, on external power. Changes are kept per profile and
+survive restarts; `px13ctl reset` or the slider reset buttons drop them.
+Profiles never overclock on their own. Requests return at once; the slow
+`nvidia-powerd` restart runs in the background, and several quick changes are
+applied together.
 
 ### Personal profiles
 
 Conditions such as "only on the barrel adapter" or "only with the lid open",
 and profiles for a modified VBIOS, are personal policy, so they are not
-defaults. Files in `/etc/px13-powerd/profiles.d/*.toml` may add profiles,
-change any key of an existing one and set the conditions for manual tuning.
-They are validated against the model's firmware ranges at startup and by
-`sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`.
+defaults. Files in `/etc/px13-powerd/profiles.d/*.toml` may change the modes,
+add profiles, change any key of an existing one and set the conditions for
+manual tuning. They are validated against the model's firmware ranges at
+startup and by `sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`.
 
 A profile or `[tuning]` can require:
 
@@ -124,16 +134,15 @@ A profile or `[tuning]` can require:
 | `lid_open`             | the lid is open                                 |
 | `cooling_confirmation` | confirmed in ROG Control Center or with `px13ctl confirm-cooling` |
 
-When a requirement of the active profile stops holding, the daemon falls back
-to Safe. Cooling confirmation is checked when a profile is chosen and cleared
-by suspend/resume, a daemon restart, any fallback and a manual return to
-Safe; confirming needs external power and an open lid.
+Confirming the cooling needs external power and an open lid; the confirmation
+is cleared when either is lost, on suspend/resume and when the service
+restarts.
 
 [`examples/profiles.d/120w.toml`](examples/profiles.d/120w.toml) is a
-complete example: Gaming only on the barrel adapter with the lid open, a 120 W
-profile that also needs cooling confirmation, and the same conditions for
-manual tuning. The 120 W profile is offered only when the installed VBIOS
-reports at least 120 W.
+complete example: the performance mode uses a 120 W profile once the cooling
+is confirmed and Gaming otherwise, both only on the barrel adapter with the
+lid open, and manual tuning needs the same. The 120 W profile is skipped when
+the installed VBIOS reports less than 120 W.
 
 ```bash
 sudo install -Dm644 examples/profiles.d/120w.toml /etc/px13-powerd/profiles.d/120w.toml
@@ -191,38 +200,33 @@ manual clock controls are disabled in Quiet Gaming.
 The daemon tells a USB-C PD charger apart from the ASUS barrel adapter by
 checking whether any `ucsi-source-psy-*` power supply is online; the barrel
 adapter only ever shows the mains supply online. A profile that requires
-`adapter` is refused on USB-C power, and the daemon falls back to Safe when
-the source changes to USB-C while it is active. A 100 W USB-C PD charger
-cannot supply Gaming: the battery drained by about 40 W in tests, so the
-example personal profiles require the adapter; Quiet Gaming is the profile
-for USB-C charging.
+`adapter` is skipped on USB-C power. A 100 W USB-C PD charger cannot supply
+Gaming: the battery drained by about 40 W in tests, so the example personal
+profiles require the adapter, and the quiet mode with its battery balance is
+the one for USB-C charging.
 
 ### asusd interference
 
-If `asusd`'s own `platform_profile_linked_epp` or
-`change_platform_profile_on_ac`/`change_platform_profile_on_battery` options
-are enabled, `asusd` can overwrite the EPP or platform profile that this
-daemon just set (for example forcing EPP back to `power` in Quiet Gaming, or
-to Performance right after plugging in AC). Set all three options to `false`
-in `/etc/asusd/asusd.ron`, stopping `asusd` first — it rewrites that file on
-exit and would otherwise discard the edit.
+asusd's `platform_profile_linked_epp` option sets the EPP of each platform
+profile, which conflicts with the EPP of the daemon's profiles (for example
+forcing `power` in Quiet Gaming). Turn it off: "Link EPP to throttle policy"
+in ROG Control Center, or `platform_profile_linked_epp: false` in
+`/etc/asusd/asusd.ron` with asusd stopped, since it rewrites that file on
+exit. `scripts/doctor.sh` checks it. asusd's switching of the platform
+profile on AC and battery is welcome: the limits follow it.
 
 ## Battery behavior
 
-Safe automatically switches variant when AC is plugged or unplugged:
+On battery the daemon does not restart `nvidia-powerd` and does not verify
+the GPU power ceiling: the NVIDIA firmware itself limits the dGPU to about
+40-45 W and disables Dynamic Boost on DC power. Checking for the AC ceiling
+there previously produced a false `nvidia-powerd synchronization failed:
+ceiling 45 W, expected 80 W` error. The dGPU is left runtime-suspended: the
+daemon does not call NVML while it sleeps, since any NVML client wakes it from
+D3cold for over 20 seconds, and the VBIOS limits are cached in the state file.
 
-- On battery: ASUS profile Quiet, EPP `power`. The daemon does not restart
-  `nvidia-powerd` and does not verify the GPU power ceiling on battery,
-  because the NVIDIA firmware itself limits the dGPU to about 45 W and
-  disables Dynamic Boost on DC power; checking for the AC ceiling here
-  previously produced a false `safe fallback failed: nvidia-powerd
-  synchronization failed: ceiling 45 W, expected 80 W` error. The dGPU is
-  intentionally left runtime-suspended: the daemon avoids `nvidia-smi` and
-  `nvidia-settings` calls on battery, since either one wakes the dGPU from
-  D3cold for over 20 seconds. VBIOS power limits are cached in the daemon's
-  state file at install/first-AC-read time so they do not need a live query.
-- On AC: ASUS profile Balanced, EPP `balance_power`.
-- Gaming and the example 120 W profile: EPP `performance`.
+To use quieter firmware settings on battery, let asusd switch to the quiet
+mode on battery; Safe itself only lowers the EPP to `power`.
 
 ## After system updates
 
@@ -258,8 +262,9 @@ sudo ./scripts/doctor.sh
 sudo ./uninstall.sh
 ```
 
-The uninstaller applies Safe first, removes DKMS and the NVIDIA drop-in, and
-restores the pre-install `power-profiles-daemon` enabled/active state.
+The service applies Safe when it stops. The uninstaller then removes DKMS and
+the NVIDIA drop-in, and restores the pre-install `power-profiles-daemon`
+enabled/active state.
 Personal profiles in `/etc/px13-powerd` are kept.
 
 ## Design and limitations
@@ -273,6 +278,13 @@ doctor after NVIDIA driver updates.
 This is an experimental power-control project. Firmware, VRM, battery,
 connector and thermal limits still apply. No software profile guarantees a
 particular sustained wattage or game performance.
+
+## Upstream
+
+The kernel's `asus-armoury` driver uses the same WMI device IDs as the
+module here but has no power limit entry for `HN7306WV`. A patch adding it is
+in [`upstream/`](upstream/), with test and submission steps; once merged,
+stock asusd and ROG Control Center can set the CPU and GPU limits.
 
 ## Adding a model
 
@@ -293,9 +305,12 @@ python3 -m unittest discover -s tests
 ```
 
 The daemon is split into a configuration loader (`config.py`), thin hardware
-interfaces (`hardware.py`, `nvidia.py`), the battery balance controller
-(`balance.py`) and the policy (`controller.py`), which knows nothing about
-D-Bus. The tests run the policy against a simulated sysfs tree.
+interfaces (`hardware.py`, and `nvidia.py` on top of NVML), the battery
+balance controller (`balance.py`) and the policy (`controller.py`), which
+knows nothing about D-Bus. The policy keeps one desired state; requests change
+it and write what is quick at once, and one worker thread performs the slow
+steps, letting newer work supersede older work. The tests run the policy
+against a simulated sysfs tree.
 
 ## Licenses
 

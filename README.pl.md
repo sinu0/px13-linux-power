@@ -21,11 +21,13 @@ dłużej utrzymać moc przed dojściem GPU do celu 87°C.
 - Moduł i filtr NVIDIA sprawdzają dokładny identyfikator DMI
   `ASUSTeK COMPUTER INC.` / `HN7306WV`, a instalator i daemon wymagają
   pasującego pliku modelu.
-- Maksymalna moc jest odczytywana z bieżącego VBIOS-u przez `nvidia-smi`.
-  Daemon oferuje tylko profile, które się w nim mieszczą.
-- Profile domyślne to Safe, Quiet Gaming i Gaming (wymaga zasilania
-  zewnętrznego). Własne zasady, np. profil 120 W dla zmodyfikowanego VBIOS-u
-  albo wymóg otwartej pokrywy, są opcjonalną konfiguracją (patrz niżej).
+- Maksymalna moc jest odczytywana z bieżącego VBIOS-u przez NVML. Daemon
+  używa tylko profili, które się w nim mieszczą.
+- Limity podążają za profilem platformy, jak tryby w G-Helperze: quiet daje
+  Quiet Gaming, balanced daje Safe, a performance daje Gaming (wymaga
+  zasilania zewnętrznego). Własne zasady, np. profil 120 W dla zmodyfikowanego
+  VBIOS-u albo wymóg otwartej pokrywy, są opcjonalną konfiguracją (patrz
+  niżej).
 - Domyślne offsety zegarów wynoszą zero; podkręcanie jest wyłącznie świadomą
   operacją użytkownika.
 - DKMS automatycznie przebudowuje moduł dla nowych kerneli, jeżeli są
@@ -34,7 +36,7 @@ dłużej utrzymać moc przed dojściem GPU do celu 87°C.
 ## Instalacja na Arch Linux
 
 ```bash
-sudo pacman -S --needed base-devel dkms python-dbus python-gobject nvidia-utils asusctl
+sudo pacman -S --needed base-devel dkms python-dbus python-gobject python-nvidia-ml-py nvidia-utils asusctl
 sudo pacman -S --needed "$(cat /usr/lib/modules/$(uname -r)/pkgbase)-headers"
 git clone https://github.com/sinu0/px13-linux-power.git
 cd px13-linux-power
@@ -74,39 +76,50 @@ wypisuje tę samą uwagę o initramfs/restarcie.
 
 ## Obsługa
 
+Tryb wybiera się profilem platformy: Fn+F5, listą profili w ROG Control Center
+albo `asusctl profile set`. Automatyczne przełączanie profilu przez asusd na
+zasilaczu i baterii („Throttle policy on AC/battery” w ROG Control Center)
+zmienia również limity.
+
 ```bash
-px13ctl state
-px13ctl capabilities
-px13ctl activate "Quiet Gaming"
-px13ctl activate Gaming
+px13ctl state            # tryb, profil, limity, telemetria
+px13ctl capabilities     # tryby i zakresy do strojenia
 px13ctl reset            # cofa ręczne zmiany aktywnego profilu
-px13ctl default          # powrót do Safe
+px13ctl confirm-cooling
 sudo ./scripts/doctor.sh
 ```
 
-Profile domyślne są w pliku modelu
-[`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml). Safe jest
-profilem domyślnym: ustawiany przy starcie, przed uśpieniem i zawsze, gdy
-przestają być spełnione warunki innego profilu. Quiet Gaming działa na
-baterii i jest przywracany po uśpieniu i restarcie daemona. Gaming wymaga
-zasilania zewnętrznego. Ręczne strojenie (suwaki w ROG Control Center) działa
-w każdym profilu poza Safe, na zasilaniu zewnętrznym; zmiany są pamiętane per
-profil, a `px13ctl reset` je cofa.
+Plik modelu [`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml)
+podaje dla każdego trybu listę profili; stosowany jest pierwszy, którego
+warunki są spełnione, a gdy żaden — Safe. Daemon ocenia to od nowa przy każdej
+zmianie trybu, źródła zasilania, pokrywy i potwierdzenia chłodzenia: po
+odłączeniu zasilacza w trybie performance przechodzi na Safe, a po
+podłączeniu wraca do Gaming. Safe jest też utrzymywany podczas uśpienia i przy
+zatrzymaniu usługi.
+
+Ręczne strojenie (suwaki w ROG Control Center) działa w każdym profilu poza
+Safe, na zasilaniu zewnętrznym. Zmiany są pamiętane per profil, także po
+restarcie; `px13ctl reset` albo przyciski resetu suwaków je cofają. Żądania
+wracają od razu, a wolny restart `nvidia-powerd` odbywa się w tle i łączy
+kilka szybkich zmian w jedną.
 
 ### Własne profile
 
-Pliki `/etc/px13-powerd/profiles.d/*.toml` mogą dodawać profile, zmieniać
-dowolny klucz istniejącego i ustawiać warunki ręcznego strojenia. Są
-sprawdzane względem zakresów firmware modelu przy starcie oraz przez
-`sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`. Dostępne warunki:
-`ac` (dowolne zasilanie zewnętrzne), `adapter` (zasilacz, nie USB-C),
-`lid_open` (otwarta pokrywa) i `cooling_confirmation` (potwierdzenie
-chłodzenia w RCC albo `px13ctl confirm-cooling`). Gdy warunek aktywnego
-profilu przestaje być spełniony, daemon wraca do Safe.
+Pliki `/etc/px13-powerd/profiles.d/*.toml` mogą zmieniać tryby, dodawać
+profile, zmieniać dowolny klucz istniejącego i ustawiać warunki ręcznego
+strojenia. Są sprawdzane względem zakresów firmware modelu przy starcie oraz
+przez `sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`. Dostępne
+warunki: `ac` (dowolne zasilanie zewnętrzne), `adapter` (zasilacz, nie
+USB-C), `lid_open` (otwarta pokrywa) i `cooling_confirmation` (potwierdzenie
+chłodzenia w RCC albo `px13ctl confirm-cooling`). Potwierdzenie wymaga
+zasilania i otwartej pokrywy i jest kasowane, gdy któregoś zabraknie, po
+uśpieniu oraz po restarcie usługi.
 
 [`examples/profiles.d/120w.toml`](examples/profiles.d/120w.toml) to pełny
-przykład: Gaming tylko na zasilaczu z otwartą pokrywą, profil 120 W z
-potwierdzeniem chłodzenia i te same warunki dla ręcznego strojenia.
+przykład: tryb performance używa profilu 120 W po potwierdzeniu chłodzenia, a
+w przeciwnym razie Gaming, oba tylko na zasilaczu z otwartą pokrywą; ręczne
+strojenie wymaga tego samego. Profil 120 W jest pomijany, gdy VBIOS raportuje
+mniej niż 120 W.
 
 ```bash
 sudo install -Dm644 examples/profiles.d/120w.toml /etc/px13-powerd/profiles.d/120w.toml
@@ -169,36 +182,33 @@ zegarów są w Quiet Gaming wyłączone.
 Daemon odróżnia ładowarkę USB-C PD od zasilacza ASUS, sprawdzając, czy jakiś
 zasilacz `ucsi-source-psy-*` jest online; zasilacz na okrągłej wtyczce
 pokazuje online wyłącznie zasilacz typu Mains. Profil wymagający `adapter`
-jest odrzucany na zasilaniu USB-C, a gdy źródło zmieni się na USB-C, daemon
-przełącza na Safe. Ładowarka USB-C PD 100 W nie udźwignie Gaming (w testach
-bateria traciła ok. 40 W), dlatego przykładowe profile własne wymagają
-zasilacza; do ładowania przez USB-C służy Quiet Gaming.
+jest pomijany na zasilaniu USB-C. Ładowarka USB-C PD 100 W nie udźwignie
+Gaming (w testach bateria traciła ok. 40 W), dlatego przykładowe profile
+własne wymagają zasilacza, a do ładowania przez USB-C służy tryb quiet z
+bilansem baterii.
 
 ### Kolizja z asusd
 
-Jeśli w `asusd` włączone są opcje `platform_profile_linked_epp` lub
-`change_platform_profile_on_ac`/`change_platform_profile_on_battery`,
-`asusd` może nadpisać EPP albo profil platformy tuż po ich ustawieniu przez
-ten daemon (np. wymuszając EPP z powrotem na `power` w Quiet Gaming, albo na
-Performance zaraz po podłączeniu zasilacza). Ustaw wszystkie trzy opcje na
-`false` w `/etc/asusd/asusd.ron`, wcześniej zatrzymując `asusd` — inaczej
-nadpisze ten plik przy wyjściu.
+Opcja `platform_profile_linked_epp` w asusd ustawia EPP dla każdego profilu
+platformy, co koliduje z EPP profili tego daemona (np. wymusza `power` w
+Quiet Gaming). Wyłącz ją: „Link EPP to throttle policy” w ROG Control Center
+albo `platform_profile_linked_epp: false` w `/etc/asusd/asusd.ron` przy
+zatrzymanym asusd, bo nadpisuje ten plik przy wyjściu. `scripts/doctor.sh` to
+sprawdza. Przełączanie profilu przez asusd na zasilaczu i baterii jest
+mile widziane: limity za nim podążają.
 
 ## Zachowanie na baterii
 
-Safe automatycznie przełącza wariant po podłączeniu lub odłączeniu zasilacza:
+Na baterii daemon nie restartuje `nvidia-powerd` i nie sprawdza limitu mocy
+GPU: firmware NVIDIA sam ogranicza dGPU do ok. 40-45 W i wyłącza Dynamic
+Boost. Sprawdzanie limitu z AC dawało wcześniej fałszywy błąd
+`nvidia-powerd synchronization failed: ceiling 45 W, expected 80 W`. dGPU
+celowo pozostaje uśpiony: daemon nie wywołuje NVML, gdy GPU śpi, bo każdy
+klient NVML budzi je z D3cold na ponad 20 sekund, a limity VBIOS-u są
+zapisane w pliku stanu.
 
-- Na baterii: profil ASUS Quiet, EPP `power`. Daemon nie restartuje
-  `nvidia-powerd` i nie sprawdza limitu mocy GPU na baterii, ponieważ firmware
-  NVIDIA sam ogranicza dGPU do około 45 W i wyłącza Dynamic Boost przy zasilaniu
-  z baterii; sprawdzanie limitu z AC w tym stanie dawało wcześniej fałszywy
-  błąd `safe fallback failed: nvidia-powerd synchronization failed: ceiling
-  45 W, expected 80 W`. dGPU celowo pozostaje uśpiony (runtime-suspended) —
-  daemon unika wywołań `nvidia-smi` i `nvidia-settings` na baterii, bo każde z
-  nich budzi dGPU z D3cold na ponad 20 sekund. Limity mocy z VBIOS-u są
-  zapisywane w pliku stanu daemona, więc nie trzeba ich odczytywać na żywo.
-- Na zasilaczu: profil ASUS Balanced, EPP `balance_power`.
-- Gaming i przykładowy profil 120 W: EPP `performance`.
+Safe na baterii obniża tylko EPP do `power`. Cichsze ustawienia firmware na
+baterii daje przełączanie przez asusd na tryb quiet na baterii.
 
 ## Po aktualizacjach systemu
 
@@ -233,7 +243,16 @@ filtra.
 sudo ./uninstall.sh
 ```
 
-Własne profile w `/etc/px13-powerd` zostają.
+Zatrzymanie usługi przywraca Safe. Własne profile w `/etc/px13-powerd`
+zostają.
+
+## Upstream
+
+Sterownik `asus-armoury` w jądrze używa tych samych identyfikatorów WMI co
+moduł z tego repozytorium, ale nie ma wpisu z limitami dla `HN7306WV`. Patch
+dodający ten wpis jest w [`upstream/`](upstream/) razem z instrukcją testu i
+wysyłki; po jego przyjęciu limity CPU i GPU obsłużą standardowe asusd i ROG
+Control Center.
 
 ## Dodawanie modelu
 
@@ -246,6 +265,9 @@ zmierzonymi na tej płycie, `make check` i pomiaru przez `px13_benchmark.py`.
 
 `make check` sprawdza składnię, uruchamia testy jednostkowe i buduje filtr
 NVPCF oraz moduł jądra. Daemon jest podzielony na ładowanie konfiguracji
-(`config.py`), cienkie interfejsy sprzętu (`hardware.py`, `nvidia.py`),
-regulator baterii (`balance.py`) i politykę (`controller.py`), która nie wie
-nic o D-Bus; testy uruchamiają ją na symulowanym drzewie sysfs.
+(`config.py`), cienkie interfejsy sprzętu (`hardware.py` oraz `nvidia.py` na
+NVML), regulator baterii (`balance.py`) i politykę (`controller.py`), która
+nie wie nic o D-Bus. Polityka trzyma jeden pożądany stan: żądania go zmieniają
+i od razu wykonują szybkie zapisy, a jeden wątek roboczy wykonuje wolne kroki,
+przy czym nowsza praca zastępuje starszą. Testy uruchamiają politykę na
+symulowanym drzewie sysfs.

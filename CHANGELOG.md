@@ -2,34 +2,48 @@
 
 ## 0.2.0 - unreleased
 
+- Limits follow the platform profile, like G-Helper's modes: Fn+F5, ROG
+  Control Center, `asusctl` and asusd's switching on AC and battery select
+  them. Each mode lists the profiles it may use; the first whose requirements
+  hold is applied, otherwise Safe. The daemon no longer sets the platform
+  profile itself, and `px13ctl` drops the profile commands.
+- Safe on battery keeps the platform profile and lowers only the EPP to
+  `power`; switching to Quiet on battery is now asusd's job (Throttle policy
+  on battery), which selects the quiet mode.
 - Move model data out of the code: `daemon/models/hn7306wv.toml` holds the
-  DMI match, firmware ranges and stock profiles (Safe, Quiet Gaming, Gaming),
-  validated at startup and by `px13_powerd.py --check`.
-- Personal policy is opt-in: `/etc/px13-powerd/profiles.d/*.toml` may add or
-  change profiles and the conditions for manual tuning. The 120 W profile and
+  DMI match, the firmware ranges, the modes and the stock profiles (Safe,
+  Quiet Gaming, Gaming), validated at startup and by `px13_powerd.py --check`.
+  GPU clock ranges and power limits come from the NVIDIA driver.
+- Personal policy is opt-in: `/etc/px13-powerd/profiles.d/*.toml` may change
+  modes, profiles and the conditions for manual tuning. The 120 W profile and
   the barrel-adapter, open-lid and cooling-confirmation conditions moved to
-  `examples/profiles.d/120w.toml`. Stock Gaming and manual tuning require
-  external power only.
-- Profile conditions are declarative (`ac`, `adapter`, `lid_open`,
-  `cooling_confirmation`); the safety guard falls back to Safe when a
-  condition of the active profile stops holding, replacing the fixed 85 W
-  high-power heuristic.
-- Manual GPU power now adjusts the active profile instead of switching to a
-  copy of the 120 W profile, which also forced CPU PPT to 5/25/35 W. Manual
-  CPU and GPU changes are kept per profile; `px13ctl reset` drops them.
+  `examples/profiles.d/120w.toml`; there, confirming the cooling upgrades the
+  performance mode from Gaming to 120 W. Stock Gaming and manual tuning
+  require external power only.
+- Requests return at once. Quick writes happen immediately; waiting for asusd
+  and restarting `nvidia-powerd` run on a worker thread where newer work
+  supersedes older work, so several slider moves cause one restart. State
+  reads never wait for NVML or slow steps. `StateChanged` and an `applying`
+  flag report progress.
+- Use NVML (`python-nvidia-ml-py`) instead of `nvidia-smi` and
+  `nvidia-settings`: clock offsets no longer need an Xwayland session, and
+  telemetry no longer spawns a process every second.
+- Manual GPU power adjusts the active profile instead of switching to a copy
+  of the 120 W profile, which also forced CPU PPT to 5/25/35 W. Manual CPU and
+  GPU changes are kept per profile; `px13ctl reset` drops them.
+- The Quiet Gaming battery balance starts at the profile's own CPU limit
+  instead of a fixed 70 % level (about 17 W instead of 15 W).
+- Stopping the service applies Safe.
 - D-Bus: rename the service to `org.asuslinux.TuningProvider` and implement
-  the tuning provider API of the asusctl fork (explicit readiness, blocked
-  reason, power groups, `Reset`). Errors now carry a proper D-Bus error name
-  instead of the name embedded in the message.
-- `px13ctl` takes profile names (`activate NAME`, `default`, `reset`,
-  `capabilities`) instead of fixed commands.
+  the tuning provider API of the asusctl fork. Errors now carry a proper
+  D-Bus error name instead of the name embedded in the message.
 - Detect power supplies, battery and lid by type instead of fixed `AC0`,
-  `BAT0` and `LID` paths; read the CPU temperature from `coretemp` and
-  `zenpower` too; find the Xwayland authority of KDE sessions as well.
+  `BAT0` and `LID` paths, ignoring peripheral batteries such as a stylus;
+  read the CPU temperature from `coretemp` and `zenpower` too.
 - Add timeouts to every helper process; `asusctl` and `nvidia-smi` calls
   could previously block the daemon indefinitely.
 - Split the daemon into configuration, hardware, NVIDIA, battery balance and
-  policy modules, and add unit tests that run the policy on a simulated sysfs
+  policy modules, with unit tests that run the policy on a simulated sysfs
   tree (`make check`).
 - Replace the RCC patch with the `tuning-provider` branch of the asusctl fork.
 - Install `/etc/modprobe.d/px13-nvidia-rtd3.conf` forcing
