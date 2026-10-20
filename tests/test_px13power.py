@@ -53,6 +53,8 @@ class Sysfs:
         write(self.supplies / "BAT0" / "type", "Battery")
         write(self.supplies / "BAT0" / "status", "Discharging")
         write(self.supplies / "BAT0" / "energy_now", 50_000_000)
+        write(self.supplies / "BAT0" / "capacity_level", "Normal")
+        write(self.supplies / "BAT0" / "voltage_now", 15_800_000)
         write(self.supplies / "ucsi-source-psy-USBC000:001" / "type", "USB")
         # A stylus battery sorts before the system battery.
         write(self.supplies / "A-stylus-battery" / "type", "Battery")
@@ -74,6 +76,14 @@ class Sysfs:
 
     def set_mode(self, mode):
         write(self.platform_profile, mode)
+
+    def set_critical(self, critical):
+        write(self.supplies / "BAT0" / "capacity_level", "Critical" if critical else "Normal")
+        if critical:
+            self.set_energy(0)
+
+    def set_voltage(self, volts):
+        write(self.supplies / "BAT0" / "voltage_now", int(volts * 1_000_000))
 
     def set_energy(self, wh):
         write(self.supplies / "BAT0" / "energy_now", int(wh * 1_000_000))
@@ -253,8 +263,9 @@ class HardwareTest(unittest.TestCase):
             self.assertEqual(supplies.source(), "usb-c")
             sysfs.set_source("battery")
             self.assertEqual(supplies.source(), "battery")
-            self.assertEqual(supplies.battery_energy_wh(), 50.0)  # not the stylus
-            self.assertFalse(supplies.battery_full())
+            battery = supplies.battery()
+            self.assertEqual((battery.energy_wh, battery.voltage_v), (50.0, 15.8))  # not the stylus
+            self.assertFalse(battery.full or battery.critical)
             sysfs.set_lid(False)
             self.assertFalse(hardware.lid_open(sysfs.lids))
             self.assertTrue(hardware.lid_open(Path(tmp) / "no-lid"))
@@ -286,6 +297,10 @@ class NvpcfTest(unittest.TestCase):
         self.assertEqual((policy["ctgp_offset_w"], policy["base_tgp_w"]), (0, 80))
 
 
+def reading(energy=50.0, voltage=15.8, full=False, critical=False):
+    return hardware.BatteryReading(energy, voltage, full, critical)
+
+
 class BalanceTest(unittest.TestCase):
     def setUp(self):
         self.balance = BatteryBalance(load_model().balance, 15, spl=15, now=0.0)
@@ -303,7 +318,7 @@ class BalanceTest(unittest.TestCase):
         start, energy, targets = self.balance.level, 50.0, None
         for second in range(1, 31):
             energy -= 0.01  # 36 W discharge
-            targets = self.balance.update(float(second), energy, battery_full=False) or targets
+            targets = self.balance.update(float(second), reading(energy)) or targets
         self.assertLess(self.balance.level, start)
         self.assertAlmostEqual(self.balance.net_power_w, -36.0, places=0)
         self.assertEqual(targets, self.balance.outputs(self.balance.level))
@@ -311,8 +326,21 @@ class BalanceTest(unittest.TestCase):
     def test_full_battery_holds_level(self):
         start = self.balance.level
         for second in range(1, 31):
-            self.assertIsNone(self.balance.update(float(second), 50.0, battery_full=True))
+            self.assertIsNone(self.balance.update(float(second), reading(full=True)))
         self.assertEqual(self.balance.level, start)
+
+    def test_empty_gauge_uses_the_voltage_trend(self):
+        start, targets = self.balance.level, None
+        for second in range(1, 21):  # charging from a strong adapter
+            targets = self.balance.update(float(second), reading(0.0, 13.0 + second * 0.002, critical=True)) or targets
+        self.assertIsNone(targets)
+        self.assertEqual(self.balance.level, start)
+        self.assertFalse(self.balance.charger_too_weak)
+        for second in range(21, 51):  # then discharging on a weak charger
+            volts = 13.04 - (second - 20) * 0.003
+            targets = self.balance.update(float(second), reading(0.0, volts, critical=True)) or targets
+        self.assertEqual(targets, (12, 1200))
+        self.assertTrue(self.balance.charger_too_weak)
 
     def test_clock_hysteresis(self):
         self.balance.gpu_clock = 1800
@@ -460,6 +488,38 @@ class TuningTest(Fixture):
         self.hw.nvidia.sleeping = False
         self.tick(60)
         self.assertEqual(self.hw.nvidia.offsets, (0, 0))
+
+    def test_quiet_mode_saves_power_on_battery(self):
+        self.sysfs.set_source("battery")
+        self.assertEqual(self.mode("quiet"), "Quiet Gaming")
+        self.assertEqual(self.hw.cpu.epp, "power")
+        self.sysfs.set_source("usb-c")
+        self.tick()
+        self.assertEqual(self.hw.cpu.epp, "balance_performance")
+
+    def empty_battery(self, volts_per_second):
+        self.sysfs.set_critical(True)
+        volts = 13.5
+        for _ in range(25):
+            volts += volts_per_second
+            self.sysfs.set_voltage(volts)
+            self.tick()
+
+    def test_weak_charger_with_an_empty_battery(self):
+        self.sysfs.set_source("usb-c")
+        self.mode("quiet")
+        self.empty_battery(-0.003)
+        self.assertEqual(self.hw.wmi.cpu_power(), (12, 17, 22))
+        self.assertEqual(self.hw.nvidia.clock_limit, 1200)
+        self.assertIn("charger does not cover the load", self.controller.state()["last_error"])
+        self.empty_battery(0.003)  # a stronger charger
+        self.assertEqual(self.controller.state()["last_error"], "")
+
+    def test_strong_adapter_with_an_empty_battery(self):
+        self.mode("quiet")
+        self.empty_battery(0.005)
+        self.assertEqual(self.hw.wmi.cpu_power(), (15, 20, 25))
+        self.assertEqual(self.controller.state()["last_error"], "")
 
     def test_quiet_gaming_balances_the_battery(self):
         self.mode("quiet")

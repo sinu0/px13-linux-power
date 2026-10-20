@@ -5,6 +5,7 @@ Nothing here decides policy; every function reads or writes one thing.
 """
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 SYS_VENDOR = Path("/sys/class/dmi/id/sys_vendor")
@@ -67,6 +68,14 @@ def platform_profile(path=PLATFORM_PROFILE):
     return read_text(path)
 
 
+@dataclass(frozen=True)
+class BatteryReading:
+    energy_wh: float | None
+    voltage_v: float | None
+    full: bool  # full or holding: no charge flow to measure
+    critical: bool  # the gauge reads empty; energy_wh is not meaningful
+
+
 class PowerSupplies:
     """Power sources, discovered by type rather than by name."""
 
@@ -94,14 +103,18 @@ class PowerSupplies:
         batteries = [path for path in self._of_type("Battery") if read_text(path / "scope") != "Device"]
         return batteries[0] if batteries else None
 
-    def battery_energy_wh(self):
+    def battery(self):
+        """The system battery's state, or None without one."""
         battery = self._battery()
-        energy = read_int(battery / "energy_now") if battery else None
-        return None if energy is None else energy / 1_000_000
-
-    def battery_full(self):
-        battery = self._battery()
-        return battery is not None and read_text(battery / "status") in {"Full", "Not charging"}
+        if battery is None:
+            return None
+        energy, voltage = read_int(battery / "energy_now"), read_int(battery / "voltage_now")
+        return BatteryReading(
+            energy_wh=None if energy is None else energy / 1_000_000,
+            voltage_v=None if voltage is None else voltage / 1_000_000,
+            full=read_text(battery / "status") in {"Full", "Not charging"},
+            critical=read_text(battery / "capacity_level") == "Critical",
+        )
 
 
 def lid_open(root=LIDS):

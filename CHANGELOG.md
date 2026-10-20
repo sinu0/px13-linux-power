@@ -34,6 +34,14 @@
 - The Quiet Gaming battery balance starts at the profile's own CPU limit
   instead of a fixed 70 % level (about 17 W instead of 15 W).
 - Stopping the service applies Safe.
+- Quiet Gaming lowers the EPP to `power` on battery: asusd often selects the
+  quiet mode on battery, where gaming tuning only drained it faster.
+- The battery balance no longer goes blind on an empty battery: the gauge
+  then reads 0 Wh, so the controller follows the trend of the battery voltage
+  and drops to its lowest level only while the voltage falls. When the battery
+  drains even at the lowest level, the status says that the charger does not
+  cover the load. The firmware keeps reporting external power and "Charging"
+  in that case, so the desktop's low-battery action never triggers.
 - D-Bus: rename the service to `org.asuslinux.TuningProvider` and implement
   the tuning provider API of the asusctl fork. Errors now carry a proper
   D-Bus error name instead of the name embedded in the message.

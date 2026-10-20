@@ -31,6 +31,7 @@ from .nvidia import NvidiaError, nvpcf_policy, write_nvpcf_override
 STATE_FILE = Path("/var/lib/px13-powerd/state.json")
 NVPCF_OVERRIDE_FILE = Path("/run/px13-powerd/nvpcf-override.conf")
 GPU_KEYS = ("gpu_tgp_offset", "gpu_dynamic_boost", "gpu_thermal_target")
+CHARGER_TOO_WEAK = "The charger does not cover the load: the battery drains even at the lowest limits"
 # asusd reapplies fan curves and cached tuning asynchronously after a mode
 # change. Waiting lets the controller's WMI budget be the final write.
 ASUSD_SETTLE_S = 2
@@ -388,9 +389,16 @@ class Controller:
 
     def _balance_step(self, now):
         """Applies the CPU target; returns a GPU clock limit to apply, or None."""
-        targets = self.balance.update(
-            now, self.hw.supplies.battery_energy_wh(), self.hw.supplies.battery_full()
-        )
+        battery = self.hw.supplies.battery()
+        if battery is None:
+            return None
+        targets = self.balance.update(now, battery)
+        weak = self.balance.charger_too_weak
+        if weak != (self.last_error == CHARGER_TOO_WEAK):
+            self.last_error = CHARGER_TOO_WEAK if weak else ""
+            if weak:
+                self.log.warning(CHARGER_TOO_WEAK)
+            self._notify()
         if targets is None:
             return None
         spl, clock = targets

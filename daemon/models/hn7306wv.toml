@@ -61,7 +61,8 @@ on_battery = { cpu_epp = "power" }
 # Gaming on the Quiet fan curve that also fits a 100 W USB-C PD charger: on
 # external power the battery balance controller trades CPU PPT and the GPU
 # clock ceiling to keep the battery gently charging. It stays within the Safe
-# GPU envelope, so it needs no conditions.
+# GPU envelope, so it needs no conditions. asusd often selects the quiet mode
+# on battery, where gaming tuning would only drain it faster.
 battery_balance = true
 platform_mode = 0
 gpu_tgp_offset = 0
@@ -69,6 +70,7 @@ gpu_dynamic_boost = 5
 gpu_thermal_target = 80
 cpu = [15, 20, 25]
 cpu_epp = "balance_performance"
+on_battery = { cpu_epp = "power" }
 
 [profiles.Gaming]
 requires = ["ac"]

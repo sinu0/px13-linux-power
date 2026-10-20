@@ -191,8 +191,18 @@ Gaming is active becomes the controller's new SPL ceiling instead of being
 overridden on the next step. The controller owns the GPU clock limit, so
 manual clock controls are disabled in Quiet Gaming.
 
+When the battery is empty its gauge reads 0 Wh; the controller then follows
+the trend of the battery voltage and holds its lowest level while it falls.
+If the battery drains even at the lowest level, the status line reports that
+the charger does not cover the load. Take this seriously: the firmware still
+reports external power and "Charging", so the desktop's low-battery
+suspend or shutdown does not trigger, and a deep discharge on a weak USB-C
+charger has latched the embedded controller into throttling the CPU to about
+600 MHz until a reboot.
+
 `px13ctl state` reports the controller under `battery_balance`
-(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`) and reports the detected power source under `power_source`
+(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`,
+`battery_draining`) and reports the detected power source under `power_source`
 (`battery`, `usb-c` or `adapter`).
 
 ### USB-C PD detection
