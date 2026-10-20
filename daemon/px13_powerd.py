@@ -29,6 +29,32 @@ LID_STATE = Path("/proc/acpi/button/lid/LID/state")
 HWMON_PATH = Path("/sys/class/hwmon")
 CPU_POLICIES = Path("/sys/devices/system/cpu/cpufreq")
 AMD_PSTATE_STATUS = Path("/sys/devices/system/cpu/amd_pstate/status")
+PCI_DEVICES = Path("/sys/bus/pci/devices")
+POWER_SUPPLIES = Path("/sys/class/power_supply")
+BATTERY = POWER_SUPPLIES / "BAT0"
+# Quiet Gaming battery balance: on external power a PI controller keeps the
+# averaged battery flow near a small charge. One 0..100 % power level drives
+# the CPU PPT first and the GPU clock ceiling only below half, because GPU
+# clocks matter most for frame pacing. The response is deliberately slow so
+# that short spikes are absorbed by the battery instead of cutting clocks.
+BALANCE_PERIOD_S = 5
+BALANCE_SETPOINT_W = 4.0
+# The battery flow is derived from the change of energy_now over this window.
+# The PX13 firmware keeps reporting "Charging" with a positive power_now while
+# the battery actually discharges under a USB-C load, so status and power_now
+# cannot provide the sign.
+BALANCE_WINDOW_S = 30.0
+BALANCE_MIN_WINDOW_S = 15.0
+BALANCE_KP = 1.0          # % per W of change in the averaged error
+BALANCE_KI = 0.02         # % per W*s of averaged error
+BALANCE_MAX_STEP = 3.0    # % per period
+BALANCE_START_LEVEL = 70.0
+BALANCE_CPU_SPL_MIN_W = 12
+BALANCE_CPU_SPL_MAX_W = 25
+BALANCE_GPU_CLOCK_MIN_MHZ = 1200
+BALANCE_GPU_CLOCK_MAX_MHZ = 2400
+BALANCE_GPU_CLOCK_HYSTERESIS_MHZ = 45
+NVIDIA_PCI_VENDOR = "0x10de"
 STATE_FILE = Path("/var/lib/px13-powerd/state.json")
 NVPCF_OVERRIDE_FILE = Path("/run/px13-powerd/nvpcf-override.conf")
 NVIDIA_DEFAULT_TGP_FALLBACK_W = 80
@@ -62,17 +88,42 @@ PROFILES = {
         "gpu_offsets": (0, 0),
         "gpu_clock_limit_mhz": 0,
         # Explicit low PPT values avoid retaining the previous Gaming/120W
-        # budget while the Safe profile has CPU boost disabled.
+        # budget.
         "cpu": (15, 20, 25),
-        # Keep CPB enabled in the driver. On amd-pstate guided mode, toggling
-        # global boost down to 0 prevents a later profile from raising its
-        # scaling_max_freq above the nominal clock. The 2 GHz policy cap is
-        # the effective Safe limit.
+        # Safe relies on PPT and EPP rather than a frequency cap. A fixed cap
+        # made short interactive bursts slower without saving energy.
         "boost": True,
-        "cpu_max_frequency_khz": 2_000_000,
+        "cpu_max_frequency_khz": None,
         "cpu_epp": "balance_power",
-        "cpu_governor": "powersave",
         "asus_profile": "Balanced",
+        # Applied on top of the keys above while running from the battery.
+        # asusd links Quiet to the same EPP; setting it here keeps the
+        # controller the final writer.
+        "battery": {
+            "cpu_epp": "power",
+            "asus_profile": "Quiet",
+        },
+    },
+    "Quiet Gaming": {
+        # Gaming on the Quiet fan curve that also fits a 100 W USB-C PD
+        # adapter: on external power the battery balance controller trades
+        # CPU PPT and the GPU clock ceiling to keep the battery gently
+        # charging. It stays within the Safe GPU envelope, so it needs
+        # neither AC nor cooling confirmation and it is restored after
+        # suspend and daemon restarts.
+        "requires_ac": False,
+        "battery_balance": True,
+        "gpu_tgp_offset": 0,
+        "platform_mode": 0,
+        "gpu_dynamic_boost": 5,
+        "gpu_thermal_target": 80,
+        "gpu_offsets": (0, 0),
+        "gpu_clock_limit_mhz": 0,
+        "cpu": (15, 20, 25),
+        "boost": True,
+        "cpu_max_frequency_khz": None,
+        "cpu_epp": "balance_performance",
+        "asus_profile": "Quiet",
     },
     "Gaming": {
         "gpu_tgp_offset": 25,
@@ -85,7 +136,6 @@ PROFILES = {
         "boost": True,
         "cpu_max_frequency_khz": None,
         "cpu_epp": "performance",
-        "cpu_governor": "schedutil",
         "asus_profile": "Performance",
     },
     "120W": {
@@ -107,7 +157,6 @@ PROFILES = {
         "boost": True,
         "cpu_max_frequency_khz": None,
         "cpu_epp": "performance",
-        "cpu_governor": "schedutil",
         "asus_profile": "Performance",
     },
 }
@@ -129,15 +178,26 @@ class Px13Power(dbus.service.Object):
         self.gpu_core_offset_mhz = 0
         self.gpu_memory_offset_mhz = 0
         self.gpu_clock_limit_mhz = 0
+        # The driver state of offsets and the clock lock is unknown until the
+        # first successful write. Resets are deferred while the dGPU sleeps.
+        self._gpu_offsets_known = False
+        self._gpu_clock_limit_known = False
+        self._gpu_reset_attempt_time = 0.0
+        self._gpu_limits = None
+        self._nvidia_pci_device = None
         self.cpu_overrides = {}
         self.nvpcf_override = {}
         self.cooling_confirmed = False
         self.last_error = ""
         self.resuming = False
         self.resume_worker_started = False
+        self.applied_source = None
+        self._balance = None
+        self._ac_change_time = None
         self._telemetry_cache_time = 0.0
         self._telemetry_cache = {}
         self._load_state()
+        self._ensure_active_pstate()
         self._write_nvpcf_override(PROFILES["Safe"])
         self._subscribe_sleep(bus)
         self._start_guard()
@@ -160,8 +220,39 @@ class Px13Power(dbus.service.Object):
     def _on_ac(self):
         return self._read_text(AC_ONLINE) == "1"
 
+    def _usb_c_power(self):
+        # The UCSI supplies are online only for a USB-C PD source. The ASUS
+        # barrel adapter reports only AC0.
+        return any(
+            self._read_text(supply / "online") == "1"
+            for supply in POWER_SUPPLIES.glob("ucsi-source-psy-*")
+        )
+
+    def _power_source(self):
+        if not self._on_ac():
+            return "battery"
+        return "usb-c" if self._usb_c_power() else "adapter"
+
     def _lid_open(self):
         return self._read_text(LID_STATE).endswith("open")
+
+    def _nvidia_runtime_status(self):
+        if self._nvidia_pci_device is None:
+            for device in PCI_DEVICES.glob("*"):
+                if (
+                    self._read_text(device / "vendor") == NVIDIA_PCI_VENDOR
+                    and self._read_text(device / "class").startswith("0x03")
+                ):
+                    self._nvidia_pci_device = device
+                    break
+            else:
+                return "unknown"
+        return self._read_text(self._nvidia_pci_device / "power" / "runtime_status")
+
+    def _dgpu_suspended(self):
+        # Any NVML client (nvidia-smi, nvidia-settings) resumes the dGPU from
+        # D3cold and keeps it awake for tens of seconds.
+        return self._nvidia_runtime_status() == "suspended"
 
     def _boost_active(self):
         if self._read_text(CPU_BOOST) != "1":
@@ -202,11 +293,33 @@ class Px13Power(dbus.service.Object):
             "epp": self._read_text(policy / "energy_performance_preference"),
         }
 
-    def _set_cpu_frequency_policy(self, max_frequency_khz, epp, governor):
+    def _ensure_active_pstate(self):
+        # Guided and passive modes have no EPP, and their powersave governor
+        # pins every core to the lowest frequency. Active mode lets the CPPC
+        # firmware pick clocks within the PPT budget using the EPP hint.
+        mode = self._read_text(AMD_PSTATE_STATUS)
+        if mode in {"active", "unknown"}:
+            return
+        try:
+            AMD_PSTATE_STATUS.write_text("active\n", encoding="ascii")
+        except OSError as error:
+            self.log.warning(
+                "amd-pstate remains in %s mode (%s); using schedutil without EPP",
+                mode,
+                error,
+            )
+            return
+        self.log.info("amd-pstate switched from %s to active mode", mode)
+
+    def _set_cpu_frequency_policy(self, max_frequency_khz, epp):
         policies = sorted(CPU_POLICIES.glob("policy*"))
         if not policies:
             raise Px13PowerError("no CPU frequency policies available")
         pstate_mode = self._read_text(AMD_PSTATE_STATUS)
+        # In active mode, powersave is the dynamic EPP-driven policy while
+        # performance pins the minimum to the maximum. In the other modes,
+        # powersave pins the CPU to its minimum, so a dynamic governor is used.
+        governor = "powersave" if pstate_mode == "active" else "schedutil"
         for policy in policies:
             value = max_frequency_khz
             if value is None:
@@ -266,21 +379,24 @@ class Px13Power(dbus.service.Object):
             "gpu_clock_mhz": None,
             "cpu_temperature_c": self._cpu_temperature(),
             "cpu_frequency_mhz": self._cpu_frequency(),
+            "gpu_runtime_status": self._nvidia_runtime_status(),
         }
-        try:
-            result = subprocess.run(
-                [
-                    "/usr/bin/nvidia-smi",
-                    "--query-gpu=power.draw,temperature.gpu,clocks.current.graphics",
-                    "--format=csv,noheader,nounits",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            result = None
+        result = None
+        if telemetry["gpu_runtime_status"] != "suspended":
+            try:
+                result = subprocess.run(
+                    [
+                        "/usr/bin/nvidia-smi",
+                        "--query-gpu=power.draw,temperature.gpu,clocks.current.graphics",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
 
         if result and result.returncode == 0 and result.stdout.strip():
             fields = [self._telemetry_number(value) for value in result.stdout.splitlines()[0].split(",")]
@@ -309,6 +425,18 @@ class Px13Power(dbus.service.Object):
             },
             "gpu_clock_limit_mhz": self.gpu_clock_limit_mhz,
             "nvpcf_override": self.nvpcf_override,
+            "power_source": self._power_source(),
+            "battery_balance": None
+            if self._balance is None
+            else {
+                "level_percent": round(self._balance["level"], 1),
+                "cpu_spl_w": self._balance["spl"],
+                "gpu_clock_limit_mhz": self._balance["gpu_clock_mhz"],
+                "battery_average_w": None
+                if self._balance["average_w"] is None
+                else round(self._balance["average_w"], 1),
+                "battery_net_w": self._battery_net_power(),
+            },
             "wmi": self._wmi_values(),
             "cpu_policy": self._cpu_policy(),
             "telemetry": self._telemetry(),
@@ -389,6 +517,7 @@ class Px13Power(dbus.service.Object):
                 {
                     "requested_profile": self.requested_profile,
                     "cpu_overrides": self.cpu_overrides,
+                    "gpu_limits": self._gpu_limits,
                 },
                 sort_keys=True,
             ),
@@ -407,6 +536,11 @@ class Px13Power(dbus.service.Object):
                 for profile, values in overrides.items():
                     if profile in PROFILES and profile != "Safe" and self._valid_cpu_power(values):
                         self.cpu_overrides[profile] = [int(value) for value in values]
+            limits = data.get("gpu_limits")
+            if isinstance(limits, list) and len(limits) == 2:
+                default_limit, max_limit = (float(value) for value in limits)
+                if 0 < default_limit <= max_limit:
+                    self._gpu_limits = [default_limit, max_limit]
         except (OSError, ValueError, TypeError):
             pass
 
@@ -435,6 +569,23 @@ class Px13Power(dbus.service.Object):
             raise Px13PowerError(f"ASUS profile {profile} failed: {detail}")
 
     def _gpu_power_limits(self):
+        # The limits come from the VBIOS and do not change at runtime. Cache
+        # them so that Safe, capability queries and battery transitions do not
+        # wake a suspended dGPU.
+        if self._gpu_limits is not None:
+            return tuple(self._gpu_limits)
+        if self._dgpu_suspended() and not self._on_ac():
+            return (None, None)
+        default_limit, max_limit = self._query_gpu_power_limits()
+        if default_limit is not None and max_limit is not None and 0 < default_limit <= max_limit:
+            self._gpu_limits = [default_limit, max_limit]
+            try:
+                self._persist_state()
+            except OSError as error:
+                self.log.warning("GPU limit cache write failed: %s", error)
+        return (default_limit, max_limit)
+
+    def _query_gpu_power_limits(self):
         try:
             result = subprocess.run(
                 [
@@ -471,8 +622,12 @@ class Px13Power(dbus.service.Object):
         profile = PROFILES[name]
         return base_tgp + profile["gpu_tgp_offset"] + profile["gpu_dynamic_boost"]
 
+    @staticmethod
+    def _low_power_profile(name):
+        return name == "Safe" or PROFILES[name].get("requires_ac") is False
+
     def _profile_supported(self, name, hardware_max=None):
-        if name == "Safe":
+        if self._low_power_profile(name):
             return True
         if hardware_max is None:
             hardware_max = self._hardware_max_tgp()
@@ -682,6 +837,7 @@ class Px13Power(dbus.service.Object):
             self.log.info("NVIDIA offsets applied: core %+d MHz, memory %+d MHz", core, memory)
             self.gpu_core_offset_mhz = core
             self.gpu_memory_offset_mhz = memory
+            self._gpu_offsets_known = True
             return True
 
     def _set_gpu_clock_limit(self, limit):
@@ -706,11 +862,47 @@ class Px13Power(dbus.service.Object):
             return False
 
         self.gpu_clock_limit_mhz = limit
+        self._gpu_clock_limit_known = True
         if limit:
             self.log.info("NVIDIA GPU clock limit applied: %d MHz", limit)
         else:
             self.log.info("NVIDIA GPU clock limit reset to default")
         return True
+
+    def _gpu_clock_reset_pending(self):
+        return not (
+            self._gpu_offsets_known
+            and self._gpu_clock_limit_known
+            and self.gpu_core_offset_mhz == 0
+            and self.gpu_memory_offset_mhz == 0
+            and self.gpu_clock_limit_mhz == 0
+        )
+
+    def _apply_gpu_clocks(self, offsets, clock_limit):
+        # Returning to defaults does not need an awake GPU: a suspended dGPU
+        # runs no clocks, and the guard applies the reset once something else
+        # has woken it. Only explicit tuning wakes the GPU immediately.
+        restoring_defaults = offsets == (0, 0) and clock_limit == 0
+        if restoring_defaults and self._dgpu_suspended():
+            if self._gpu_clock_reset_pending():
+                self.log.info("NVIDIA clock reset deferred until the dGPU is awake")
+            return
+        if not (
+            self._gpu_offsets_known
+            and (self.gpu_core_offset_mhz, self.gpu_memory_offset_mhz) == tuple(offsets)
+        ):
+            self._set_gpu_offsets(*offsets)
+        if not (self._gpu_clock_limit_known and self.gpu_clock_limit_mhz == clock_limit):
+            self._set_gpu_clock_limit(clock_limit)
+
+    def _resolve_profile(self, name):
+        profile = dict(PROFILES[name])
+        battery = profile.pop("battery", None)
+        if battery and self._power_source() == "battery":
+            profile.update(battery)
+        if name in self.cpu_overrides:
+            profile["cpu"] = tuple(self.cpu_overrides[name])
+        return profile
 
     def _apply_profile(self, name, require_confirmation=True):
         if name not in PROFILES:
@@ -721,36 +913,70 @@ class Px13Power(dbus.service.Object):
             raise Px13PowerError(
                 f"{name} exceeds the GPU firmware maximum ({limit})"
             )
-        if name != "Safe" and require_confirmation:
+        if not self._low_power_profile(name) and require_confirmation:
             if not self._on_ac():
                 raise Px13PowerError(f"{name} requires AC power")
+            if self._usb_c_power():
+                raise Px13PowerError(
+                    f"{name} requires the ASUS barrel adapter; USB-C PD supplies at most 100 W"
+                )
             if not self._lid_open():
                 raise Px13PowerError(f"{name} requires an open lid")
             if name == "120W" and not self.cooling_confirmed:
                 raise Px13PowerError("120W requires cooling confirmation")
 
-        profile = dict(PROFILES[name])
-        if name in self.cpu_overrides:
-            profile["cpu"] = tuple(self.cpu_overrides[name])
+        on_ac = self._on_ac()
+        profile = self._resolve_profile(name)
         self._set_asus_profile(profile["asus_profile"])
         # asusd reapplies fan curves and cached profile tuning asynchronously.
         # Let that transaction finish before our manual WMI profile becomes the
         # final writer; otherwise its CPU PPT values can win the race.
         time.sleep(2)
-        self._set_gpu_offsets(*profile["gpu_offsets"])
-        self._set_gpu_clock_limit(profile["gpu_clock_limit_mhz"])
+        self._apply_gpu_clocks(profile["gpu_offsets"], profile["gpu_clock_limit_mhz"])
         self._write_power_budget(profile)
         self._set_boost(profile["boost"])
         self._set_cpu_frequency_policy(
             profile["cpu_max_frequency_khz"],
             profile["cpu_epp"],
-            profile["cpu_governor"],
         )
         self.active_profile = name
-        if not self.resuming:
+        self.applied_source = self._power_source()
+        self._balance = None
+        if profile.get("battery_balance"):
+            self._balance = {
+                "level": BALANCE_START_LEVEL,
+                "spl": profile["cpu"][0],
+                "spl_max": BALANCE_CPU_SPL_MAX_W,
+                "gpu_clock_mhz": 0,
+                "average_w": None,
+                "last_error": None,
+                "energy": [],
+                "last_eval": time.monotonic(),
+            }
+        if self.resuming:
+            pass
+        elif on_ac:
             self._sync_nvidia_powerd(profile)
+        else:
+            # On battery the firmware caps the dGPU (45 W on this model) and
+            # disables Dynamic Boost, and asusd may stop nvidia-powerd. Keep
+            # the override current for its next start instead of restarting it
+            # and waking the dGPU to verify a ceiling that cannot be reached.
+            self._write_nvpcf_override(profile)
         self.last_error = ""
         self._emit_state()
+
+    def _restore_low_power_profile(self):
+        name = self.requested_profile
+        if name == "Safe" or name not in PROFILES or not self._low_power_profile(name):
+            return
+        try:
+            self._apply_profile(name, require_confirmation=False)
+        except Px13PowerError as error:
+            self.last_error = f"{name} restore failed: {error}"
+            self.log.error(self.last_error)
+        else:
+            self.log.info("restored %s", name)
 
     def _apply_safe(self, reason):
         self.cooling_confirmed = False
@@ -770,6 +996,14 @@ class Px13Power(dbus.service.Object):
         return False
 
     def _gpu_ready(self):
+        if not self._on_ac():
+            # On battery nothing needs the dGPU after resume. A bound driver is
+            # enough; querying NVML would only wake the GPU from D3cold.
+            self._nvidia_runtime_status()
+            return (
+                self._nvidia_pci_device is not None
+                and (self._nvidia_pci_device / "driver").exists()
+            )
         result = subprocess.run(
             ["/usr/bin/nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             check=False,
@@ -801,6 +1035,7 @@ class Px13Power(dbus.service.Object):
                 self._emit_state()
                 return
             self._apply_safe("resume requires renewed cooling confirmation")
+            self._restore_low_power_profile()
             self.log.info("NVIDIA driver stable after resume; leaving nvidia-powerd to NVIDIA's hook")
             self._emit_state()
 
@@ -842,10 +1077,136 @@ class Px13Power(dbus.service.Object):
         while True:
             time.sleep(1)
             with self.lock:
+                now = time.monotonic()
+                on_ac = self._on_ac()
+                source = self._power_source()
                 high_power = self.nvpcf_override.get("max_tgp_w", 0) > 85
-                if high_power and (not self._on_ac() or not self._lid_open()):
+                if high_power and (not on_ac or source == "usb-c" or not self._lid_open()):
                     self.cooling_confirmed = False
+                    self._ac_change_time = None
                     self._apply_safe("AC or lid safety condition changed")
+                    continue
+                if self._balance is not None and not self.resuming:
+                    if on_ac:
+                        self._balance_step(now)
+                    else:
+                        self._balance["average_w"] = None
+                        self._balance["energy"] = []
+                if self.resuming or self.active_profile != "Safe":
+                    self._ac_change_time = None
+                    continue
+                if self.applied_source is not None and source != self.applied_source:
+                    # asusd switches its platform profile on the same event.
+                    # Wait for it so that the battery/AC Safe variant is final.
+                    if self._ac_change_time is None:
+                        self._ac_change_time = now
+                    elif now - self._ac_change_time >= 3:
+                        self._ac_change_time = None
+                        self._apply_safe("power source changed")
+                    continue
+                self._ac_change_time = None
+                if (
+                    self._gpu_clock_reset_pending()
+                    and now - self._gpu_reset_attempt_time >= 60
+                    and not self._dgpu_suspended()
+                ):
+                    self._gpu_reset_attempt_time = now
+                    self._apply_gpu_clocks((0, 0), 0)
+
+    @staticmethod
+    def _balance_cpu(spl):
+        return (spl, spl + 5, spl + 10)
+
+    def _battery_energy_wh(self):
+        try:
+            return int(self._read_text(BATTERY / "energy_now")) / 1_000_000
+        except ValueError:
+            return None
+
+    def _battery_full(self):
+        return self._read_text(BATTERY / "status") in {"Full", "Not charging"}
+
+    def _battery_net_power(self):
+        # Positive while charging, negative while discharging, measured from
+        # the stored energy. None until the window is long enough or while the
+        # battery is full and therefore shows no headroom.
+        if self._balance is None or self._battery_full():
+            return None
+        history = self._balance["energy"]
+        if len(history) < 2:
+            return None
+        (start, first), (end, last) = history[0], history[-1]
+        if end - start < BALANCE_MIN_WINDOW_S:
+            return None
+        return (last - first) * 3600.0 / (end - start)
+
+    def _balance_outputs(self, level):
+        balance = self._balance
+        cpu_share = min(1.0, max(0.0, (level - 50.0) / 50.0))
+        gpu_share = min(1.0, max(0.0, level / 50.0))
+        spl = round(
+            BALANCE_CPU_SPL_MIN_W
+            + (balance["spl_max"] - BALANCE_CPU_SPL_MIN_W) * cpu_share
+        )
+        if gpu_share >= 1.0:
+            clock = 0
+        else:
+            clock = BALANCE_GPU_CLOCK_MIN_MHZ + (
+                BALANCE_GPU_CLOCK_MAX_MHZ - BALANCE_GPU_CLOCK_MIN_MHZ
+            ) * gpu_share
+            clock = int(clock // GPU_CLOCK_LIMIT_STEP_MHZ * GPU_CLOCK_LIMIT_STEP_MHZ)
+        return max(BALANCE_CPU_SPL_MIN_W, spl), clock
+
+    def _balance_step(self, now):
+        balance = self._balance
+        energy = self._battery_energy_wh()
+        if energy is not None:
+            history = balance["energy"]
+            history.append((now, energy))
+            while len(history) > 2 and now - history[1][0] >= BALANCE_WINDOW_S:
+                history.pop(0)
+        sample = self._battery_net_power()
+        balance["average_w"] = sample
+        elapsed = now - balance["last_eval"]
+        if elapsed < BALANCE_PERIOD_S:
+            return
+        balance["last_eval"] = now
+        # A full or holding battery shows no headroom; keep the current level.
+        if sample is None or balance["average_w"] is None:
+            balance["last_error"] = None
+            return
+
+        error = balance["average_w"] - BALANCE_SETPOINT_W
+        derivative = 0.0 if balance["last_error"] is None else error - balance["last_error"]
+        balance["last_error"] = error
+        change = BALANCE_KP * derivative + BALANCE_KI * error * elapsed
+        change = max(-BALANCE_MAX_STEP, min(BALANCE_MAX_STEP, change))
+        balance["level"] = max(0.0, min(100.0, balance["level"] + change))
+
+        spl, clock = self._balance_outputs(balance["level"])
+        try:
+            if spl != balance["spl"]:
+                self._write_cpu_budget({"cpu": self._balance_cpu(spl)})
+                balance["spl"] = spl
+            previous_clock = balance["gpu_clock_mhz"]
+            if clock != previous_clock and (
+                clock == 0
+                or previous_clock == 0
+                or abs(clock - previous_clock) >= BALANCE_GPU_CLOCK_HYSTERESIS_MHZ
+            ):
+                if self._set_gpu_clock_limit(clock):
+                    balance["gpu_clock_mhz"] = clock
+        except Px13PowerError as error_detail:
+            self.last_error = f"battery balance failed: {error_detail}"
+            self.log.error(self.last_error)
+        self.log.debug(
+            "battery balance: average %+.1f W, level %.1f %%, CPU SPL %d W, GPU clock %s",
+            balance["average_w"],
+            balance["level"],
+            balance["spl"],
+            balance["gpu_clock_mhz"] or "unlimited",
+        )
+        self._emit_state()
 
     def _start_guard(self):
         threading.Thread(target=self._guard_worker, daemon=True).start()
@@ -954,7 +1315,6 @@ class Px13Power(dbus.service.Object):
                 self._set_cpu_frequency_policy(
                     profile["cpu_max_frequency_khz"],
                     profile["cpu_epp"],
-                    profile["cpu_governor"],
                 )
                 self.active_profile = "Custom"
                 self._sync_nvidia_powerd(profile)
@@ -1008,6 +1368,10 @@ class Px13Power(dbus.service.Object):
                     "org.asuslinux.Px13Power.Error", str(error)
                 ) from error
 
+            if self._balance is not None:
+                # In Quiet Gaming the requested SPL becomes the balance ceiling.
+                self._balance["spl"] = values[0]
+                self._balance["spl_max"] = max(BALANCE_CPU_SPL_MIN_W, values[0])
             target_profile = self.active_profile
             if target_profile not in PROFILES:
                 target_profile = self.requested_profile
@@ -1092,6 +1456,7 @@ class Px13Power(dbus.service.Object):
         with self.lock:
             self.cooling_confirmed = False
             self._apply_safe("daemon startup")
+            self._restore_low_power_profile()
 
 
 def main():

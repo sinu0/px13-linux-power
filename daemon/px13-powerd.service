@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 [Unit]
 Description=ASUS ProArt PX13 power profile controller
-After=asusd.service systemd-modules-load.service
-Before=nvidia-powerd.service
+After=asusd.service nvidia-powerd.service systemd-modules-load.service
 Wants=asusd.service nvidia-powerd.service
 # A package update can replace the modules of the still-running kernel.  Do
 # not restart the controller into a broken state; the DKMS hook has already
@@ -48,7 +47,7 @@ UMask=0077
 ProtectHome=tmpfs
 BindReadOnlyPaths=-/run/user
 ProtectSystem=strict
-ReadWritePaths=/sys/module/px13_tgp_probe/parameters /sys/devices/system/cpu/cpufreq /var/lib/px13-powerd /run/px13-powerd
+ReadWritePaths=/sys/module/px13_tgp_probe/parameters /sys/devices/system/cpu/cpufreq /sys/devices/system/cpu/amd_pstate /var/lib/px13-powerd /run/px13-powerd
 
 [Install]
 WantedBy=multi-user.target

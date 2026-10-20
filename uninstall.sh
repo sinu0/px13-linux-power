@@ -26,6 +26,18 @@ rm -f /etc/systemd/system/px13-powerd.service \
     /usr/local/bin/px13ctl
 rm -rf /usr/local/lib/px13-powerd
 
+if [ -f /etc/modprobe.d/px13-nvidia-rtd3.conf ]; then
+    rm -f /etc/modprobe.d/px13-nvidia-rtd3.conf
+    printf 'px13-linux-power: removed RTD3 NVIDIA modprobe config.\n'
+    printf 'px13-linux-power: regenerate the initramfs (e.g. sudo mkinitcpio -P) and reboot.\n'
+fi
+
+if [ -f /etc/modprobe.d/px13-nvidia-s0ix.conf ]; then
+    rm -f /etc/modprobe.d/px13-nvidia-s0ix.conf
+    printf 'px13-linux-power: removed S0ix NVIDIA modprobe config.\n'
+    printf 'px13-linux-power: regenerate the initramfs (e.g. sudo mkinitcpio -P) and reboot.\n'
+fi
+
 if dkms status -m px13-tgp -v "$MODULE_VERSION" 2>/dev/null | grep -q .; then
     dkms remove -m px13-tgp -v "$MODULE_VERSION" --all
 fi

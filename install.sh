@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 set -eu
 
-PROJECT_VERSION="0.1.0"
+PROJECT_VERSION="0.2.0"
 MODULE_VERSION="5.0"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
@@ -47,14 +47,22 @@ trap rollback EXIT HUP INT TERM
 
 [ "$(id -u)" -eq 0 ] || die "run this installer with sudo"
 
-if [ "${1:-}" = "--install-deps" ]; then
+INSTALL_DEPS=0
+ENABLE_S0IX=0
+for arg in "$@"; do
+    case "$arg" in
+        --install-deps) INSTALL_DEPS=1 ;;
+        --enable-s0ix) ENABLE_S0IX=1 ;;
+        *) die "usage: sudo ./install.sh [--install-deps] [--enable-s0ix]" ;;
+    esac
+done
+
+if [ "$INSTALL_DEPS" -eq 1 ]; then
     command -v pacman >/dev/null 2>&1 || die "--install-deps currently supports Arch Linux only"
     pkgbase=$(cat "/usr/lib/modules/$KERNEL/pkgbase" 2>/dev/null || true)
     [ -n "$pkgbase" ] || die "cannot determine the current kernel package"
     pacman -S --needed base-devel dkms python-dbus python-gobject nvidia-utils asusctl \
         "${pkgbase}-headers"
-elif [ "$#" -ne 0 ]; then
-    die "usage: sudo ./install.sh [--install-deps]"
 fi
 
 vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
@@ -75,6 +83,16 @@ unit_exists nvidia-powerd.service ||
     die "nvidia-powerd.service is missing; install an NVIDIA driver with Dynamic Boost"
 nvidia-smi --query-gpu=name,power.default_limit,power.max_limit \
     --format=csv,noheader >/dev/null 2>&1 || die "NVIDIA GPU is not available"
+
+# The daemon switches amd-pstate to active mode at startup, but the kernel
+# command line decides the mode used before it runs and after it is removed.
+case " $(cat /proc/cmdline) " in
+    *" amd_pstate=active "*) ;;
+    *)
+        printf 'px13-linux-power: warning: the kernel command line does not set amd_pstate=active.\n' >&2
+        printf 'px13-linux-power: warning: the daemon switches modes at runtime; set amd_pstate=active (replacing guided) to apply it from boot.\n' >&2
+        ;;
+esac
 
 for unit in auto-cpufreq.service lactd.service tlp.service; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
@@ -134,6 +152,14 @@ install -m 0644 "$ROOT/nvpcf-override/libnvpcf_override.so" \
 install -m 0644 "$ROOT/nvpcf-override/nvidia-powerd-px13.conf" \
     /etc/systemd/system/nvidia-powerd.service.d/px13-nvpcf.conf
 
+install -m 0644 "$ROOT/nvidia/px13-nvidia-rtd3.conf" \
+    /etc/modprobe.d/px13-nvidia-rtd3.conf
+
+if [ "$ENABLE_S0IX" -eq 1 ]; then
+    install -m 0644 "$ROOT/nvidia/px13-nvidia-s0ix.conf" \
+        /etc/modprobe.d/px13-nvidia-s0ix.conf
+fi
+
 systemctl stop px13-powerd.service nvidia-powerd.service 2>/dev/null || true
 modprobe -r px13_tgp_probe 2>/dev/null || true
 modprobe px13_tgp_probe ||
@@ -144,12 +170,23 @@ modprobe px13_tgp_probe ||
 systemctl daemon-reload
 systemctl reload dbus.service 2>/dev/null || true
 systemctl enable nvidia-powerd.service >/dev/null 2>&1 || true
+systemctl start nvidia-powerd.service
+systemctl start asusd.service
 systemctl enable --now px13-powerd.service
 sleep 8
 /usr/local/bin/px13ctl safe >/dev/null
+systemctl is-active --quiet asusd.service || die "asusd failed to start"
 systemctl is-active --quiet nvidia-powerd.service || die "nvidia-powerd failed to start"
 systemctl is-active --quiet px13-powerd.service || die "px13-powerd failed to start"
 
 SUCCESS=1
 printf 'PX13 Linux Power %s installed. The machine is in Safe.\n' "$PROJECT_VERSION"
 printf 'Run: px13ctl state; sudo ./scripts/doctor.sh\n'
+if ! grep -q '^DynamicPowerManagement: 2$' /proc/driver/nvidia/params 2>/dev/null; then
+    printf 'RTD3 config installed to /etc/modprobe.d/px13-nvidia-rtd3.conf.\n'
+    printf 'Regenerate the initramfs (e.g. sudo mkinitcpio -P) and reboot for it to take effect.\n'
+fi
+if [ "$ENABLE_S0IX" -eq 1 ]; then
+    printf 'S0ix support installed to /etc/modprobe.d/px13-nvidia-s0ix.conf.\n'
+    printf 'Regenerate the initramfs (e.g. sudo mkinitcpio -P) and reboot for it to take effect.\n'
+fi

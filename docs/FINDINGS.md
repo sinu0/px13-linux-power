@@ -103,3 +103,102 @@ Relevant upstream documentation and discussion:
 
 No NVIDIA firmware flash, NVIDIA binary patch or forced NVML power-limit write
 is part of this project.
+
+## 2026-09 re-evaluation
+
+Re-tested on kernel `7.3.0-rc1` (CachyOS), NVIDIA `610.57.04`, `asusctl`
+6.4.0, with the boot cmdline using `amd_pstate=guided`.
+
+- Correction to the "Measurements" section above: the roughly 606 MHz /
+  605 MHz CPU behavior is now confirmed, on this kernel/driver combination, to
+  be caused by `amd_pstate=guided` combined with the Safe profile's
+  `powersave` governor. In `guided` mode `powersave` pins the CPU at its
+  minimum P-state (~605 MHz) under load, regardless of the configured CPU
+  PPT. The original text attributed "roughly 606 MHz behavior" to the 5/5/5 W
+  CPU PPT test specifically; that attribution is at least partly wrong. The
+  5/5/5 W run was not re-measured under `amd_pstate=active`, so whether it
+  would show the same floor-clock behavior independent of governor is
+  unknown — only the guided+powersave mechanism has been confirmed as a
+  cause of the ~600 MHz lock.
+- In `guided` (and `passive`) mode, the per-policy
+  `energy_performance_preference` sysfs file does not exist at all. Both the
+  daemon's EPP settings and asusd's `platform_profile_linked_epp` therefore
+  had no effect while `amd_pstate` was in `guided` mode — there was nothing
+  to write to.
+- `amd_pstate=active` restores the EPP sysfs files and lets `powersave` +
+  EPP behave as intended (EPP controls the target within the driver's own
+  P-state range, instead of the generic cpufreq governor forcing the floor).
+  Daemon 0.2.0 switches `amd_pstate` to `active` at runtime when possible and
+  recommends `amd_pstate=active` on the kernel command line; when `active` is
+  not available it uses `schedutil` rather than `powersave` in
+  `guided`/`passive`, and Safe no longer applies a hard 2 GHz cap on top.
+- Kernel 7.3 ships `asus_armoury` firmware attributes (`nv_tgp`,
+  `ppt_pl1_spl`, ...) but they return `ENODEV` on `HN7306WV`, because the
+  in-kernel driver has no power-limit table entry for this board. The DKMS
+  module in this repository remains required until an upstream
+  `asus-armoury` `power_data` entry for `HN7306WV` exists.
+- On battery, the NVIDIA firmware itself limits the dGPU to about 45 W and
+  disables Dynamic Boost; the pre-2026-09 daemon's post-fallback ceiling
+  check (which expected the AC-level 80 W baseline) produced a false `safe
+  fallback failed: nvidia-powerd synchronization failed: ceiling 45 W,
+  expected 80 W` error on battery. 0.2.0 no longer restarts `nvidia-powerd`
+  or verifies the GPU ceiling when running on battery, and avoids
+  `nvidia-smi`/`nvidia-settings` calls while the dGPU is runtime-suspended,
+  since either call wakes it from D3cold for more than 20 seconds. VBIOS
+  power limits are cached in the daemon state file instead of being queried
+  live every time.
+- The NVPCF filter was re-confirmed working against NVIDIA `610.57.04`.
+- Before the battery balance controller existed, running Gaming/Quiet Gaming
+  on a 100 W USB-C PD charger drew approximately 140 W at the wall while the
+  battery lost about 40 W, because the daemon applied the same WMI/NVPCF
+  power limits regardless of the detected power source, and the laptop's own
+  draw exceeded what the 100 W charger could supply. On a later occasion the
+  machine then would not charge, even sitting idle, until it was hibernated
+  and resumed; the exact cause is not confirmed — it is plausibly the
+  charger or the EC's own overcurrent/overpower protection latching, but
+  this has not been verified against any specific mechanism. This is the
+  motivation for the battery balance controller and for refusing Gaming/
+  120 W on USB-C power (see README.md).
+- The battery balance controller's original sign source, an EMA of
+  `power_now`/`status`, was itself wrong. Verified on this PX13 under a
+  USB-C gaming load: the firmware kept reporting `status` `Charging` with
+  `power_now` around +30..39 W while `energy_now` was actually falling — a
+  real flow of −35.3 W (`energy_now` 23.30 → 22.79 Wh in 50 s). `status`/
+  `power_now` therefore cannot provide the sign of the battery flow on this
+  hardware; a controller trusting them raised power to 100 %, the worst
+  possible response to an actual discharge. The controller now derives the
+  flow from the change of BAT0 `energy_now` over a sliding 30 s window
+  (`BALANCE_WINDOW_S`), needing at least 15 s of history
+  (`BALANCE_MIN_WINDOW_S`) before it produces a reading, and holding the
+  last reading while `status` is `Full`/`Not charging`. Because `energy_now`
+  only has whole-µWh granularity, a 30 s window reading steps in increments
+  of roughly 1.9 W rather than changing smoothly.
+  Measured live, in the same game session, after switching to the
+  `energy_now`-window controller: the battery flow went from −34 W to about
+  0/−2 W within roughly 3 minutes as the controller cut CPU SPL to 12 W and
+  then the GPU clock ceiling to about 1950..2010 MHz (GPU power about
+  53..55 W), and temperatures dropped from GPU 88 °C / CPU 94 °C to about
+  76 °C / 77 °C.
+- NVIDIA `610.57.04` ignores a negative NVPCF cTGP offset: with the NVPCF
+  filter asked to write a `-30000` mW cTGP offset, the reported GPU power
+  ceiling stayed at 80 W instead of dropping. Watt-based GPU power capping
+  below the VBIOS default is therefore not achievable through this filter on
+  this driver version; the battery balance controller instead lowers the
+  NVIDIA GPU clock ceiling (`nvidia-smi --lock-gpu-clocks`) to reduce GPU
+  power. The filter continues to reject negative offsets rather than send
+  one the driver silently ignores.
+- `asusd`'s own `platform_profile_linked_epp` and
+  `change_platform_profile_on_ac`/`change_platform_profile_on_battery`
+  options raced this daemon and overrode its choices — for example EPP was
+  forced back to `power` while Quiet Gaming was active, and to Performance
+  immediately after plugging in AC. All three options are set to `false` in
+  `/etc/asusd/asusd.ron` on the test machine; see the README for the
+  procedure (stop `asusd` before editing, since it rewrites the file on
+  exit).
+- The distro `rog-control-center` 6.4.0 package replaced the patched GUI
+  binary, which is why the CPU wattage sliders disappeared: stock RCC 6.4.0
+  reads CPU PPT through `asus-armoury` firmware attributes, which return
+  `ENODEV` on `HN7306WV` (see above). The GPU tuning provider patch in
+  `rcc/` was ported to `asusctl` 6.4.0; the only required change was that
+  the `init_property!`/`setup_external!` macros in 6.4.0 no longer take a
+  type argument.

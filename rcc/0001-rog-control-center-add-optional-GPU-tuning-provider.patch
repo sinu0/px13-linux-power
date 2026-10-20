@@ -4,120 +4,15 @@ Date: Thu, 16 Jul 2026 00:22:40 +0200
 Subject: [PATCH] rog-control-center: add optional GPU tuning provider
 
 ---
- Cargo.lock                                    |  43 +-
- rog-control-center/Cargo.toml                 |   1 +
- rog-control-center/src/ui/mod.rs              |   2 +
- .../src/ui/setup_nvidia_tuning.rs             | 454 ++++++++++++++++++
- rog-control-center/src/ui/setup_system.rs     |  10 +-
- rog-control-center/ui/pages/gpu.slint         | 336 ++++++++++++-
- rog-control-center/ui/pages/system.slint      | 139 +++---
- 7 files changed, 874 insertions(+), 111 deletions(-)
- create mode 100644 rog-control-center/src/ui/setup_nvidia_tuning.rs
+  rog-control-center/src/ui/mod.rs                 |   2 +
+  rog-control-center/src/ui/setup_nvidia_tuning.rs | 454 +++++++++++++++++++++++
+  rog-control-center/src/ui/setup_system.rs        |  10 +-
+  rog-control-center/ui/pages/gpu.slint            | 336 ++++++++++++++++-
+  rog-control-center/ui/pages/system.slint         | 139 +++----
+  5 files changed, 871 insertions(+), 70 deletions(-)
 
-diff --git a/Cargo.lock b/Cargo.lock
-index 2d9d73cc..f1042968 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -229,7 +229,6 @@ dependencies = [
-  "argh",
-  "dmi_id",
-  "env_logger",
-- "gumdrop",
-  "log",
-  "png 0.17.16",
-  "rog_anime",
-@@ -284,8 +283,8 @@ dependencies = [
-  "rog_platform",
-  "ron",
-  "serde",
-- "smol",
-  "thiserror 2.0.18",
-+ "tokio",
-  "zbus",
- ]
- 
-@@ -327,17 +326,6 @@ dependencies = [
-  "slab",
- ]
- 
--[[package]]
--name = "async-fs"
--version = "2.2.0"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "8034a681df4aed8b8edbd7fbe472401ecf009251c8b40556b304567052e294c5"
--dependencies = [
-- "async-lock",
-- "blocking",
-- "futures-lite",
--]
--
- [[package]]
- name = "async-io"
- version = "2.6.0"
-@@ -367,17 +355,6 @@ dependencies = [
-  "pin-project-lite",
- ]
- 
--[[package]]
--name = "async-net"
--version = "2.0.0"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "b948000fad4873c1c9339d60f2623323a0cfd3816e5181033c6a5cb68b2accf7"
--dependencies = [
-- "async-io",
-- "blocking",
-- "futures-lite",
--]
--
- [[package]]
- name = "async-process"
- version = "2.5.0"
-@@ -4703,6 +4680,7 @@ dependencies = [
-  "rog_profiles",
-  "rog_slash",
-  "serde",
-+ "serde_json",
-  "slint",
-  "slint-build",
-  "thiserror 2.0.18",
-@@ -5333,23 +5311,6 @@ dependencies = [
-  "wayland-backend",
- ]
- 
--[[package]]
--name = "smol"
--version = "2.0.2"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "a33bd3e260892199c3ccfc487c88b2da2265080acb316cd920da72fdfd7c599f"
--dependencies = [
-- "async-channel",
-- "async-executor",
-- "async-fs",
-- "async-io",
-- "async-lock",
-- "async-net",
-- "async-process",
-- "blocking",
-- "futures-lite",
--]
--
- [[package]]
- name = "smol_str"
- version = "0.2.2"
-diff --git a/rog-control-center/Cargo.toml b/rog-control-center/Cargo.toml
-index 97c56b44..2a3937a0 100644
---- a/rog-control-center/Cargo.toml
-+++ b/rog-control-center/Cargo.toml
-@@ -38,6 +38,7 @@ env_logger.workspace = true
- 
- tokio.workspace = true
- serde.workspace = true
-+serde_json = "1.0"
- zbus.workspace = true
- dirs.workspace = true
- notify-rust.workspace = true
 diff --git a/rog-control-center/src/ui/mod.rs b/rog-control-center/src/ui/mod.rs
-index 563c6d4c..60f3457e 100644
+index 6bbcf8bd..fefc3b49 100644
 --- a/rog-control-center/src/ui/mod.rs
 +++ b/rog-control-center/src/ui/mod.rs
 @@ -2,6 +2,7 @@ pub mod setup_anime;
@@ -128,7 +23,7 @@ index 563c6d4c..60f3457e 100644
  pub mod setup_slash;
  pub mod setup_system;
  
-@@ -177,6 +178,7 @@ pub fn setup_window(
+@@ -188,6 +189,7 @@ pub fn setup_window(
  
      // Populate GPU page choices and callbacks
      setup_gpu::setup_gpu_page(&ui);
@@ -597,10 +492,10 @@ index 00000000..cd563dbf
 +    });
 +}
 diff --git a/rog-control-center/src/ui/setup_system.rs b/rog-control-center/src/ui/setup_system.rs
-index 3de07613..26e9500d 100644
+index a6f2ffd6..2c1f28a8 100644
 --- a/rog-control-center/src/ui/setup_system.rs
 +++ b/rog-control-center/src/ui/setup_system.rs
-@@ -51,11 +51,16 @@ pub fn setup_system_page(ui: &MainWindow, _config: Arc<Mutex<Config>>) {
+@@ -62,11 +62,16 @@ pub fn setup_system_page(
      ui.global::<SystemPageData>().set_ppt_apu_sppt(MINMAX);
      ui.global::<SystemPageData>().set_ppt_platform_sppt(MINMAX);
      ui.global::<SystemPageData>().set_nv_tgp(MINMAX);
@@ -615,22 +510,22 @@ index 3de07613..26e9500d 100644
 +    ui.global::<SystemPageData>()
 +        .set_cpu_power_provider_ready(false);
  
-     if let Ok(sys_props) = platform
-         .supported_properties()
-@@ -662,7 +667,10 @@ pub fn setup_system_page_callbacks(ui: &MainWindow, _states: Arc<Mutex<Config>>)
+     let has_dgpu = {
+         let devices = rog_platform::gpu_pci::Device::find().unwrap_or_default();
+@@ -770,7 +775,10 @@ pub fn setup_system_page_callbacks(ui: &MainWindow, _states: Arc<Mutex<Config>>)
                                  setup_callback_restore_default!(nv_temp_target, handle, attr);
                                  setup_minmax_external!(nv_temp_target, handle, attr, platform);
                              }
 -                            FirmwareAttribute::DgpuBaseTgp => {}
 +                            FirmwareAttribute::DgpuBaseTgp => {
-+                                init_property!(nv_base_tgp, handle, value, i32);
-+                                setup_external!(nv_base_tgp, i32, handle, attr, value);
++                                init_property!(nv_base_tgp, handle, value);
++                                setup_external!(nv_base_tgp, handle, attr, value);
 +                            }
                              FirmwareAttribute::DgpuTgp => {
                                  init_minmax_property!(nv_tgp, handle, attr);
-                                 setup_callback!(nv_tgp, handle, attr, i32);
+                                 setup_callback!(nv_tgp, handle, attr);
 diff --git a/rog-control-center/ui/pages/gpu.slint b/rog-control-center/ui/pages/gpu.slint
-index de85e537..bc35f297 100644
+index a0d9f358..033b40c5 100644
 --- a/rog-control-center/ui/pages/gpu.slint
 +++ b/rog-control-center/ui/pages/gpu.slint
 @@ -1,7 +1,8 @@
@@ -719,8 +614,8 @@ index de85e537..bc35f297 100644
 +            : GPUPageData.driver_boost_max;
      clip: true;
  
-     ScrollView {
-@@ -129,6 +196,269 @@ export component PageGPU inherits Rectangle {
+     property <[string]> modes_all: [@tr("Integrated"), @tr("Hybrid"), @tr("Ultimate")];
+@@ -135,6 +202,269 @@ export component PageGPU inherits Rectangle {
                      }
                  }
              }
@@ -993,7 +888,7 @@ index de85e537..bc35f297 100644
 \ No newline at end of file
 +}
 diff --git a/rog-control-center/ui/pages/system.slint b/rog-control-center/ui/pages/system.slint
-index 48f1edf0..a90b65a3 100644
+index 4558e681..f4a1e4e9 100644
 --- a/rog-control-center/ui/pages/system.slint
 +++ b/rog-control-center/ui/pages/system.slint
 @@ -138,6 +138,10 @@ export global SystemPageData {
@@ -1007,10 +902,10 @@ index 48f1edf0..a90b65a3 100644
      in-out property <AttrMinMax> nv_temp_target: {
          min: 0,
          max: 80,
-@@ -152,6 +156,12 @@ export global SystemPageData {
-     in-out property <bool> ppt_enabled_available;
-     in-out property <bool> ppt_enabled;
-     callback cb_ppt_enabled(bool);
+@@ -174,6 +178,12 @@ export global SystemPageData {
+     in-out property <float> igpu_usage_val: -1.0;
+     in-out property <bool> has_igpu: false;
+     in-out property <bool> dgpu_suspended: false;
 +
 +    // Optional tuning provider used when the standard firmware attributes are
 +    // absent. It reuses the native CPU controls instead of adding model UI.
@@ -1020,7 +915,7 @@ index 48f1edf0..a90b65a3 100644
  }
  
  export component PageSystem inherits Rectangle {
-@@ -171,7 +181,15 @@ export component PageSystem inherits Rectangle {
+@@ -193,7 +203,15 @@ export component PageSystem inherits Rectangle {
          (active_profile_value == 0 && (FanPageData.balanced_cpu_enabled || FanPageData.balanced_gpu_enabled || FanPageData.balanced_mid_enabled)) ||
          (active_profile_value == 1 && (FanPageData.performance_cpu_enabled || FanPageData.performance_gpu_enabled || FanPageData.performance_mid_enabled)) ||
          ((active_profile_value == 2 || active_profile_value == 3) && (FanPageData.quiet_cpu_enabled || FanPageData.quiet_gpu_enabled || FanPageData.quiet_mid_enabled));
@@ -1037,7 +932,7 @@ index 48f1edf0..a90b65a3 100644
      clip: true;
  
      ScrollView {
-@@ -355,7 +373,7 @@ export component PageSystem inherits Rectangle {
+@@ -592,7 +610,7 @@ export component PageSystem inherits Rectangle {
                  }
              }
  
@@ -1046,7 +941,7 @@ index 48f1edf0..a90b65a3 100644
                  padding-right: 10px;
                  padding-left: 10px;
                  alignment: LayoutAlignment.space-between;
-@@ -386,7 +404,7 @@ export component PageSystem inherits Rectangle {
+@@ -623,7 +641,7 @@ export component PageSystem inherits Rectangle {
                  }
              }
  
@@ -1055,7 +950,7 @@ index 48f1edf0..a90b65a3 100644
                  background: #665500;
                  max-height: 30px;
                  VerticalBox {
-@@ -400,21 +418,43 @@ export component PageSystem inherits Rectangle {
+@@ -637,21 +655,43 @@ export component PageSystem inherits Rectangle {
                  }
              }
  
@@ -1102,7 +997,7 @@ index 48f1edf0..a90b65a3 100644
                  }
              }
  
-@@ -422,17 +462,28 @@ export component PageSystem inherits Rectangle {
+@@ -659,17 +699,28 @@ export component PageSystem inherits Rectangle {
                  text: @tr("ppt_pl2_sppt" => "CPU Turbo Power Limit");
                  title: @tr("ppt_pl2_sppt" => "CPU Turbo Power Limit");
                  help_text: @tr("ppt_pl2_sppt_help" => "Short-term CPU power limit for boost periods. Controls maximum power during brief high-performance bursts.");
@@ -1135,7 +1030,7 @@ index 48f1edf0..a90b65a3 100644
                  }
              }
  
-@@ -440,17 +491,26 @@ export component PageSystem inherits Rectangle {
+@@ -677,17 +728,26 @@ export component PageSystem inherits Rectangle {
                  text: @tr("ppt_pl3_fppt" => "CPU Fast Burst Power Limit");
                  title: @tr("ppt_pl3_fppt" => "CPU Fast Burst Power Limit");
                  help_text: @tr("ppt_pl3_fppt_help" => "Ultra-short duration power limit for instantaneous CPU bursts. Affects responsiveness during sudden workload spikes.");
@@ -1165,7 +1060,7 @@ index 48f1edf0..a90b65a3 100644
                  }
              }
              if SystemPageData.ppt_fppt.max > 0 && SystemPageData.ppt_fppt.current != -1: SystemSlider {
-@@ -507,59 +567,6 @@ export component PageSystem inherits Rectangle {
+@@ -744,59 +804,6 @@ export component PageSystem inherits Rectangle {
                  }
              }
  
@@ -1225,6 +1120,3 @@ index 48f1edf0..a90b65a3 100644
          }
      }
  
--- 
-2.55.0
-

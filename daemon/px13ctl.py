@@ -23,6 +23,7 @@ def main():
             "prepare-suspend",
             "resume-after-sleep",
             "safe",
+            "quiet-gaming",
             "gaming",
             "120w",
         ),
@@ -40,7 +41,12 @@ def main():
     elif args.command == "resume-after-sleep":
         result = controller.ResumeAfterSleep()
     else:
-        profile = {"safe": "Safe", "gaming": "Gaming", "120w": "120W"}[args.command]
+        profile = {
+            "safe": "Safe",
+            "quiet-gaming": "Quiet Gaming",
+            "gaming": "Gaming",
+            "120w": "120W",
+        }[args.command]
         result = controller.Activate(profile)
     print(json.dumps(json.loads(str(result)), indent=2, sort_keys=True))
 
