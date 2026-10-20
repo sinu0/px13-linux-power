@@ -18,17 +18,14 @@ dłużej utrzymać moc przed dojściem GPU do celu 87°C.
 
 ## Najważniejsze zasady
 
-- Instalator, moduł, daemon i filtr NVIDIA sprawdzają dokładny identyfikator
-  DMI `ASUSTeK COMPUTER INC.` / `HN7306WV`.
+- Moduł i filtr NVIDIA sprawdzają dokładny identyfikator DMI
+  `ASUSTeK COMPUTER INC.` / `HN7306WV`, a instalator i daemon wymagają
+  pasującego pliku modelu.
 - Maksymalna moc jest odczytywana z bieżącego VBIOS-u przez `nvidia-smi`.
-  Profil 120 W nie pojawi się, jeśli firmware raportuje niższy limit.
-- Quiet Gaming zostawia cichy profil wentylatorów ASUS Quiet i budżet WMI GPU
-  z Safe, a CPU startuje z PPT 15/20/25 W i EPP `balance_performance`. Działa
-  na baterii, nie wymaga potwierdzenia chłodzenia i jest przywracany po
-  uśpieniu/wybudzeniu oraz restarcie daemona.
-- Gaming wymaga zasilacza i otwartej pokrywy. Profil 120 W oraz ręczne
-  sterowanie wymagają dodatkowo potwierdzenia chłodzenia. Potwierdzenie jest
-  kasowane po uśpieniu i zmianie warunków.
+  Daemon oferuje tylko profile, które się w nim mieszczą.
+- Profile domyślne to Safe, Quiet Gaming i Gaming (wymaga zasilania
+  zewnętrznego). Własne zasady, np. profil 120 W dla zmodyfikowanego VBIOS-u
+  albo wymóg otwartej pokrywy, są opcjonalną konfiguracją (patrz niżej).
 - Domyślne offsety zegarów wynoszą zero; podkręcanie jest wyłącznie świadomą
   operacją użytkownika.
 - DKMS automatycznie przebudowuje moduł dla nowych kerneli, jeżeli są
@@ -79,17 +76,52 @@ wypisuje tę samą uwagę o initramfs/restarcie.
 
 ```bash
 px13ctl state
-px13ctl quiet-gaming
-px13ctl gaming
-px13ctl confirm-cooling
-px13ctl 120w
-px13ctl safe
+px13ctl capabilities
+px13ctl activate "Quiet Gaming"
+px13ctl activate Gaming
+px13ctl reset            # cofa ręczne zmiany aktywnego profilu
+px13ctl default          # powrót do Safe
 sudo ./scripts/doctor.sh
+```
+
+Profile domyślne są w pliku modelu
+[`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml). Safe jest
+profilem domyślnym: ustawiany przy starcie, przed uśpieniem i zawsze, gdy
+przestają być spełnione warunki innego profilu. Quiet Gaming działa na
+baterii i jest przywracany po uśpieniu i restarcie daemona. Gaming wymaga
+zasilania zewnętrznego. Ręczne strojenie (suwaki w ROG Control Center) działa
+w każdym profilu poza Safe, na zasilaniu zewnętrznym; zmiany są pamiętane per
+profil, a `px13ctl reset` je cofa.
+
+### Własne profile
+
+Pliki `/etc/px13-powerd/profiles.d/*.toml` mogą dodawać profile, zmieniać
+dowolny klucz istniejącego i ustawiać warunki ręcznego strojenia. Są
+sprawdzane względem zakresów firmware modelu przy starcie oraz przez
+`sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`. Dostępne warunki:
+`ac` (dowolne zasilanie zewnętrzne), `adapter` (zasilacz, nie USB-C),
+`lid_open` (otwarta pokrywa) i `cooling_confirmation` (potwierdzenie
+chłodzenia w RCC albo `px13ctl confirm-cooling`). Gdy warunek aktywnego
+profilu przestaje być spełniony, daemon wraca do Safe.
+
+[`examples/profiles.d/120w.toml`](examples/profiles.d/120w.toml) to pełny
+przykład: Gaming tylko na zasilaczu z otwartą pokrywą, profil 120 W z
+potwierdzeniem chłodzenia i te same warunki dla ręcznego strojenia.
+
+```bash
+sudo install -Dm644 examples/profiles.d/120w.toml /etc/px13-powerd/profiles.d/120w.toml
+sudo systemctl restart px13-powerd
 ```
 
 Przy wysokiej mocy laptop musi być otwarty i mieć drożny dolot oraz wylot
 powietrza. Pełna analiza przyczyny i wyniki pomiarów są w
 [`docs/FINDINGS.md`](docs/FINDINGS.md).
+
+### ROG Control Center
+
+Kontrolki pojawiają się w ROG Control Center z małym forkiem asusctl, który
+dodaje obsługę zewnętrznego providera; patrz [`rcc/`](rcc/). CLI i backend
+D-Bus działają bez niego.
 
 ### Bilans baterii w Quiet Gaming
 
@@ -123,24 +155,24 @@ nieograniczonego w dół do 1200 MHz. Limit GPU jest cięty jako ostatni, dopier
 gdy CPU jest już na swoim minimum, ponieważ to on ma największe znaczenie dla
 płynności klatek. Gdy bateria jest pełna albo nie ładuje się, nie ma sygnału
 o dostępnym zapasie, więc poziom zostaje utrzymany na ostatniej wartości.
-Ręczna zmiana mocy CPU (niestandardowa moc w `px13ctl` albo suwaki CPU w ROG
-Control Center) przy aktywnym Quiet Gaming staje się nowym limitem SPL
-regulatora, zamiast być nadpisywana w kolejnym kroku.
+Ręczna zmiana mocy CPU (suwaki CPU w ROG Control Center) przy aktywnym Quiet
+Gaming staje się nowym limitem SPL regulatora, zamiast być nadpisywana w
+kolejnym kroku. Regulator zarządza limitem zegara GPU, więc ręczne kontrolki
+zegarów są w Quiet Gaming wyłączone.
 
 `px13ctl state` pokazuje regulator pod kluczem `battery_balance`
-(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_average_w`,
-`battery_net_w`) oraz wykryte źródło zasilania pod `power_source`
+(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`) oraz wykryte źródło zasilania pod `power_source`
 (`battery`, `usb-c` albo `adapter`).
 
 ### Wykrywanie USB-C PD
 
 Daemon odróżnia ładowarkę USB-C PD od zasilacza ASUS, sprawdzając, czy jakiś
 zasilacz `ucsi-source-psy-*` jest online; zasilacz na okrągłej wtyczce
-pokazuje online wyłącznie `AC0`. Gaming i profil 120 W są odrzucane na
-zasilaniu USB-C (`... requires the ASUS barrel adapter; USB-C PD supplies at
-most 100 W`), a jeśli aktywny jest już profil wysokiej mocy i źródło zmieni
-się na USB-C, daemon przełącza na Safe — tak samo jak przy odłączeniu
-zasilacza czy zamknięciu pokrywy.
+pokazuje online wyłącznie zasilacz typu Mains. Profil wymagający `adapter`
+jest odrzucany na zasilaniu USB-C, a gdy źródło zmieni się na USB-C, daemon
+przełącza na Safe. Ładowarka USB-C PD 100 W nie udźwignie Gaming (w testach
+bateria traciła ok. 40 W), dlatego przykładowe profile własne wymagają
+zasilacza; do ładowania przez USB-C służy Quiet Gaming.
 
 ### Kolizja z asusd
 
@@ -166,7 +198,7 @@ Safe automatycznie przełącza wariant po podłączeniu lub odłączeniu zasilac
   nich budzi dGPU z D3cold na ponad 20 sekund. Limity mocy z VBIOS-u są
   zapisywane w pliku stanu daemona, więc nie trzeba ich odczytywać na żywo.
 - Na zasilaczu: profil ASUS Balanced, EPP `balance_power`.
-- Gaming / 120 W: EPP `performance` (tak jak dotychczas, wyłącznie na AC).
+- Gaming i przykładowy profil 120 W: EPP `performance`.
 
 ## Po aktualizacjach systemu
 
@@ -200,3 +232,20 @@ filtra.
 ```bash
 sudo ./uninstall.sh
 ```
+
+Własne profile w `/etc/px13-powerd` zostają.
+
+## Dodawanie modelu
+
+Daemon działa tylko z zweryfikowanym plikiem modelu. Nowa płyta wymaga wpisu
+DMI w tabeli `px13_dmi_table` modułu (po sprawdzeniu, że firmware używa tych
+samych identyfikatorów WMI), pliku modelu w `daemon/models/` z zakresami
+zmierzonymi na tej płycie, `make check` i pomiaru przez `px13_benchmark.py`.
+
+## Rozwój
+
+`make check` sprawdza składnię, uruchamia testy jednostkowe i buduje filtr
+NVPCF oraz moduł jądra. Daemon jest podzielony na ładowanie konfiguracji
+(`config.py`), cienkie interfejsy sprzętu (`hardware.py`, `nvidia.py`),
+regulator baterii (`balance.py`) i politykę (`controller.py`), która nie wie
+nic o D-Bus; testy uruchamiają ją na symulowanym drzewie sysfs.

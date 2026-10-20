@@ -2,6 +2,36 @@
 
 ## 0.2.0 - unreleased
 
+- Move model data out of the code: `daemon/models/hn7306wv.toml` holds the
+  DMI match, firmware ranges and stock profiles (Safe, Quiet Gaming, Gaming),
+  validated at startup and by `px13_powerd.py --check`.
+- Personal policy is opt-in: `/etc/px13-powerd/profiles.d/*.toml` may add or
+  change profiles and the conditions for manual tuning. The 120 W profile and
+  the barrel-adapter, open-lid and cooling-confirmation conditions moved to
+  `examples/profiles.d/120w.toml`. Stock Gaming and manual tuning require
+  external power only.
+- Profile conditions are declarative (`ac`, `adapter`, `lid_open`,
+  `cooling_confirmation`); the safety guard falls back to Safe when a
+  condition of the active profile stops holding, replacing the fixed 85 W
+  high-power heuristic.
+- Manual GPU power now adjusts the active profile instead of switching to a
+  copy of the 120 W profile, which also forced CPU PPT to 5/25/35 W. Manual
+  CPU and GPU changes are kept per profile; `px13ctl reset` drops them.
+- D-Bus: rename the service to `org.asuslinux.TuningProvider` and implement
+  the tuning provider API of the asusctl fork (explicit readiness, blocked
+  reason, power groups, `Reset`). Errors now carry a proper D-Bus error name
+  instead of the name embedded in the message.
+- `px13ctl` takes profile names (`activate NAME`, `default`, `reset`,
+  `capabilities`) instead of fixed commands.
+- Detect power supplies, battery and lid by type instead of fixed `AC0`,
+  `BAT0` and `LID` paths; read the CPU temperature from `coretemp` and
+  `zenpower` too; find the Xwayland authority of KDE sessions as well.
+- Add timeouts to every helper process; `asusctl` and `nvidia-smi` calls
+  could previously block the daemon indefinitely.
+- Split the daemon into configuration, hardware, NVIDIA, battery balance and
+  policy modules, and add unit tests that run the policy on a simulated sysfs
+  tree (`make check`).
+- Replace the RCC patch with the `tuning-provider` branch of the asusctl fork.
 - Install `/etc/modprobe.d/px13-nvidia-rtd3.conf` forcing
   `NVreg_DynamicPowerManagement=0x02` (fine-grained RTD3). NVIDIA 615.78.08
   reports "Runtime D3 status: Disabled by default" on this unit: SMBIOS

@@ -1,8 +1,10 @@
 # PX13 Linux Power
 
 Experimental, model-scoped CPU/GPU power control for the ASUS ProArt PX13
-`HN7306WV`. It exposes Safe, Gaming and hardware-dependent maximum profiles,
-plus CPU PPT, NVIDIA power, temperature and clock controls.
+`HN7306WV`. It gives the GPU the power budget the same firmware uses on
+Windows, with Safe, Quiet Gaming and Gaming profiles plus CPU PPT, NVIDIA
+power, temperature and clock controls. Personal policies, such as a 120 W
+profile for a modified VBIOS, are opt-in configuration.
 
 This project exists because the tested PX13 firmware returns lower NVIDIA
 NVPCF values to Linux than the values selected through ASUS WMI. It does not
@@ -16,13 +18,14 @@ flash a GPU VBIOS and does not patch NVIDIA driver binaries.
 - A DKMS-capable kernel with matching headers
 - systemd and system D-Bus
 
-The installer, kernel module, daemon and NVIDIA filter all enforce the exact
-DMI vendor/board pair. Other PX13 variants are intentionally rejected until
-their WMI and NVPCF behavior is independently verified.
+The kernel module and NVIDIA filter enforce the exact DMI vendor/board pair,
+and the installer and daemon require a matching model file. Other PX13
+variants are intentionally rejected until their WMI and NVPCF behavior is
+independently verified; see [Adding a model](#adding-a-model).
 
-The daemon reads `power.max_limit` from the installed NVIDIA firmware. A 120 W
-profile is advertised only when that firmware reports at least 120 W. This
-repository does not include or install a custom VBIOS.
+The daemon reads `power.max_limit` from the installed NVIDIA firmware and
+offers only profiles that fit it. This repository does not include or install
+a custom VBIOS.
 
 ## Install
 
@@ -78,25 +81,70 @@ initramfs/reboot note.
 
 ```bash
 px13ctl state
-px13ctl quiet-gaming
-px13ctl gaming
-px13ctl confirm-cooling
-px13ctl 120w
-px13ctl safe
+px13ctl capabilities
+px13ctl activate "Quiet Gaming"
+px13ctl activate Gaming
+px13ctl reset            # drop manual changes of the active profile
+px13ctl default          # back to Safe
 sudo ./scripts/doctor.sh
 ```
 
-Quiet Gaming keeps the ASUS Quiet fan profile and the Safe GPU WMI envelope,
-and starts the CPU at PPT 15/20/25 W with the `balance_performance` EPP. It
-works on battery, needs no cooling confirmation and is restored after
-suspend/resume and daemon restarts. Gaming requires AC power and an open lid.
-The 120 W profile and manual CPU/GPU/clock tuning additionally require a
-fresh cooling confirmation. Confirmation is cleared after suspend/resume,
-daemon restart, AC removal, lid closure or a manual return to Safe. Keep the
-laptop open and ensure unobstructed intake and exhaust airflow.
+### Profiles
 
-ROG Control Center integration is supplied as an MPL-2.0 patch in [`rcc/`](rcc/).
-The CLI and D-Bus backend work without the GUI patch.
+The stock profiles live in the model file
+[`daemon/models/hn7306wv.toml`](daemon/models/hn7306wv.toml):
+
+- **Safe** is the default. It is applied at startup, before suspend and
+  whenever the conditions of another profile stop holding.
+- **Quiet Gaming** keeps the ASUS Quiet fan profile and the Safe GPU WMI
+  envelope, and starts the CPU at PPT 15/20/25 W with the
+  `balance_performance` EPP. It works on battery and is restored after
+  suspend/resume and daemon restarts.
+- **Gaming** requires external power.
+
+Manual CPU/GPU/clock tuning (ROG Control Center sliders) is possible in any
+profile except Safe, on external power. Changes are kept per profile;
+`px13ctl reset` drops them. Profiles never overclock on their own.
+
+### Personal profiles
+
+Conditions such as "only on the barrel adapter" or "only with the lid open",
+and profiles for a modified VBIOS, are personal policy, so they are not
+defaults. Files in `/etc/px13-powerd/profiles.d/*.toml` may add profiles,
+change any key of an existing one and set the conditions for manual tuning.
+They are validated against the model's firmware ranges at startup and by
+`sudo /usr/local/lib/px13-powerd/px13_powerd.py --check`.
+
+A profile or `[tuning]` can require:
+
+| Requirement            | Meaning                                         |
+| ---------------------- | ----------------------------------------------- |
+| `ac`                   | any external power, including USB-C             |
+| `adapter`              | external power that is not USB-C PD             |
+| `lid_open`             | the lid is open                                 |
+| `cooling_confirmation` | confirmed in ROG Control Center or with `px13ctl confirm-cooling` |
+
+When a requirement of the active profile stops holding, the daemon falls back
+to Safe. Cooling confirmation is checked when a profile is chosen and cleared
+by suspend/resume, a daemon restart, any fallback and a manual return to
+Safe; confirming needs external power and an open lid.
+
+[`examples/profiles.d/120w.toml`](examples/profiles.d/120w.toml) is a
+complete example: Gaming only on the barrel adapter with the lid open, a 120 W
+profile that also needs cooling confirmation, and the same conditions for
+manual tuning. The 120 W profile is offered only when the installed VBIOS
+reports at least 120 W.
+
+```bash
+sudo install -Dm644 examples/profiles.d/120w.toml /etc/px13-powerd/profiles.d/120w.toml
+sudo systemctl restart px13-powerd
+```
+
+### ROG Control Center
+
+The controls appear in ROG Control Center with a small asusctl fork that adds
+tuning provider support; see [`rcc/`](rcc/). The CLI and D-Bus backend work
+without it.
 
 ### Quiet Gaming battery balance
 
@@ -129,24 +177,25 @@ FPPT = SPL + 10 W); below 50 % it instead lowers the NVIDIA GPU clock ceiling
 clock is cut last, after the CPU is already at its floor, because it matters
 most for frame pacing. When the battery is full or not charging there is no
 charge/discharge signal to react to, so the level is held at its last value.
-A manual CPU power change (`px13ctl` custom power, or the ROG Control Center
-CPU sliders) while Quiet Gaming is active becomes the controller's new SPL
-ceiling instead of being overridden on the next step.
+A manual CPU power change (the ROG Control Center CPU sliders) while Quiet
+Gaming is active becomes the controller's new SPL ceiling instead of being
+overridden on the next step. The controller owns the GPU clock limit, so
+manual clock controls are disabled in Quiet Gaming.
 
 `px13ctl state` reports the controller under `battery_balance`
-(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_average_w`,
-`battery_net_w`) and reports the detected power source under `power_source`
+(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`) and reports the detected power source under `power_source`
 (`battery`, `usb-c` or `adapter`).
 
 ### USB-C PD detection
 
 The daemon tells a USB-C PD charger apart from the ASUS barrel adapter by
 checking whether any `ucsi-source-psy-*` power supply is online; the barrel
-adapter only ever shows the `AC0` supply online. Gaming and the 120 W profile
-are refused while on USB-C power (`... requires the ASUS barrel adapter;
-USB-C PD supplies at most 100 W`), and if a high-power profile is already
-active and the source changes to USB-C, the daemon falls back to Safe, the
-same as it does for AC removal or lid closure.
+adapter only ever shows the mains supply online. A profile that requires
+`adapter` is refused on USB-C power, and the daemon falls back to Safe when
+the source changes to USB-C while it is active. A 100 W USB-C PD charger
+cannot supply Gaming: the battery drained by about 40 W in tests, so the
+example personal profiles require the adapter; Quiet Gaming is the profile
+for USB-C charging.
 
 ### asusd interference
 
@@ -173,7 +222,7 @@ Safe automatically switches variant when AC is plugged or unplugged:
   D3cold for over 20 seconds. VBIOS power limits are cached in the daemon's
   state file at install/first-AC-read time so they do not need a live query.
 - On AC: ASUS profile Balanced, EPP `balance_power`.
-- Gaming / 120 W: EPP `performance` (AC-only, as before).
+- Gaming and the example 120 W profile: EPP `performance`.
 
 ## After system updates
 
@@ -211,6 +260,7 @@ sudo ./uninstall.sh
 
 The uninstaller applies Safe first, removes DKMS and the NVIDIA drop-in, and
 restores the pre-install `power-profiles-daemon` enabled/active state.
+Personal profiles in `/etc/px13-powerd` are kept.
 
 ## Design and limitations
 
@@ -224,10 +274,32 @@ This is an experimental power-control project. Firmware, VRM, battery,
 connector and thermal limits still apply. No software profile guarantees a
 particular sustained wattage or game performance.
 
+## Adding a model
+
+The daemon runs only on systems with a verified model file. Supporting another
+board needs:
+
+1. its DMI board name in the kernel module's `px13_dmi_table`, after checking
+   that its firmware uses the same WMI device IDs;
+2. a model file in `daemon/models/` with the ranges measured on that board
+   and its stock profiles;
+3. `make check`, then a measured run with `px13_benchmark.py`.
+
+## Development
+
+```bash
+make check    # syntax, unit tests, NVPCF filter and kernel module builds
+python3 -m unittest discover -s tests
+```
+
+The daemon is split into a configuration loader (`config.py`), thin hardware
+interfaces (`hardware.py`, `nvidia.py`), the battery balance controller
+(`balance.py`) and the policy (`controller.py`), which knows nothing about
+D-Bus. The tests run the policy against a simulated sysfs tree.
+
 ## Licenses
 
 - Kernel module: GPL-2.0-only
 - Daemon, tools and NVPCF filter: MIT
-- ROG Control Center patch: MPL-2.0
 
 Full texts are in [`LICENSES/`](LICENSES/).
