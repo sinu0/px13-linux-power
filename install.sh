@@ -76,7 +76,7 @@ python3 -c 'import dbus, gi, pynvml' >/dev/null 2>&1 ||
     die "Python dbus, gi or pynvml (python-nvidia-ml-py) modules are missing"
 # Only systems with a verified model file are supported; this also validates
 # any personal profiles in /etc/px13-powerd/profiles.d.
-python3 "$ROOT/daemon/px13_powerd.py" --check ||
+python3 -B "$ROOT/daemon/px13_powerd.py" --check ||
     die "unsupported system or invalid configuration (see above)"
 unit_exists asusd.service || die "asusd.service is missing; install and configure asusctl"
 unit_exists nvidia-powerd.service ||
