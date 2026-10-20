@@ -117,6 +117,7 @@ def main():
         nvidia=Nvidia(),
         lid_open=hardware.lid_open,
         platform_profile=hardware.platform_profile,
+        sleep_system=hardware.sleep_system,
     )
     controller = Controller(model, hw, log)
     Service(bus, controller)

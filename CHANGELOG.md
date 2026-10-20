@@ -34,6 +34,12 @@
 - The Quiet Gaming battery balance starts at the profile's own CPU limit
   instead of a fixed 70 % level (about 17 W instead of 15 W).
 - Stopping the service applies Safe.
+- Battery watch in every profile: on external power the daemon measures the
+  battery from its stored energy and reports when the charger does not cover
+  the load. A critical battery that keeps draining for a minute hibernates
+  the system, or suspends it when hibernation is not set up, because the
+  desktop's own low-battery action never triggers while the firmware reports
+  "Charging".
 - Quiet Gaming lowers the EPP to `power` on battery: asusd often selects the
   quiet mode on battery, where gaming tuning only drained it faster.
 - The battery balance no longer goes blind on an empty battery: the gauge

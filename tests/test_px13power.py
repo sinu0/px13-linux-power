@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "daemon"))
 
 from px13power import config, hardware  # noqa: E402
 from px13power.balance import BatteryBalance  # noqa: E402
+from px13power.battery import BatteryMonitor  # noqa: E402
 from px13power.controller import Controller, RequestError  # noqa: E402
 from px13power.nvidia import nvpcf_policy  # noqa: E402
 
@@ -169,6 +170,8 @@ class Fixture(unittest.TestCase):
         self.model = load_model(*self.overlays)
         self.time = 1000.0
         self.sleep = lambda seconds: None
+        self.sleeps = []
+        self.volts = 13.5
         self.hw = SimpleNamespace(
             supplies=hardware.PowerSupplies(self.sysfs.supplies),
             cpu=FakeCpu(),
@@ -176,6 +179,7 @@ class Fixture(unittest.TestCase):
             nvidia=FakeNvidia(self.vbios_max),
             lid_open=lambda: hardware.lid_open(self.sysfs.lids),
             platform_profile=lambda: hardware.platform_profile(self.sysfs.platform_profile),
+            sleep_system=lambda: self.sleeps.append("suspend") or "suspend",
         )
         self.controller = self.new_controller()
 
@@ -301,9 +305,50 @@ def reading(energy=50.0, voltage=15.8, full=False, critical=False):
     return hardware.BatteryReading(energy, voltage, full, critical)
 
 
+class MonitorTest(unittest.TestCase):
+    def setUp(self):
+        self.monitor = BatteryMonitor()
+        self.time = 0
+
+    def feed(self, seconds, energy=lambda t: 50.0, voltage=lambda t: 15.8, **flags):
+        for _ in range(seconds):
+            self.time += 1
+            self.monitor.update(float(self.time), reading(energy(self.time), voltage(self.time), **flags))
+
+    def test_energy_flow(self):
+        self.feed(30, energy=lambda t: 50.0 - t * 0.01)  # 36 W discharge
+        self.assertAlmostEqual(self.monitor.net_power_w, -36.0, places=0)
+        self.assertTrue(self.monitor.draining)
+
+    def test_small_losses_are_noise(self):
+        self.feed(30, energy=lambda t: 50.0 - t * 0.0003)  # about 1 W
+        self.assertFalse(self.monitor.draining)
+
+    def test_needs_a_long_enough_window(self):
+        self.feed(10, energy=lambda t: 50.0 - t * 0.01)
+        self.assertIsNone(self.monitor.net_power_w)
+        self.assertFalse(self.monitor.draining)
+
+    def test_empty_gauge_uses_the_voltage_trend(self):
+        self.feed(20, energy=lambda t: 0.0, voltage=lambda t: 13.0 + t * 0.002, critical=True)
+        self.assertFalse(self.monitor.draining)
+        self.feed(40, energy=lambda t: 0.0, voltage=lambda t: 13.04 - (t - 20) * 0.003, critical=True)
+        self.assertTrue(self.monitor.draining)
+        self.assertIsNone(self.monitor.net_power_w)
+
+    def test_full_battery_shows_no_flow(self):
+        self.feed(30, energy=lambda t: 50.0 - t * 0.01, full=True)
+        self.assertFalse(self.monitor.draining)
+
+
 class BalanceTest(unittest.TestCase):
     def setUp(self):
         self.balance = BatteryBalance(load_model().balance, 15, spl=15, now=0.0)
+        self.monitor = BatteryMonitor()
+
+    def feed(self, second, battery):
+        self.monitor.update(float(second), battery)
+        return self.balance.update(float(second), self.monitor)
 
     def test_starts_at_the_profile_limit(self):
         self.assertEqual(self.balance.outputs(self.balance.level), (15, 0))
@@ -318,29 +363,22 @@ class BalanceTest(unittest.TestCase):
         start, energy, targets = self.balance.level, 50.0, None
         for second in range(1, 31):
             energy -= 0.01  # 36 W discharge
-            targets = self.balance.update(float(second), reading(energy)) or targets
+            targets = self.feed(second, reading(energy)) or targets
         self.assertLess(self.balance.level, start)
-        self.assertAlmostEqual(self.balance.net_power_w, -36.0, places=0)
         self.assertEqual(targets, self.balance.outputs(self.balance.level))
 
     def test_full_battery_holds_level(self):
         start = self.balance.level
         for second in range(1, 31):
-            self.assertIsNone(self.balance.update(float(second), reading(full=True)))
+            self.assertIsNone(self.feed(second, reading(full=True)))
         self.assertEqual(self.balance.level, start)
 
-    def test_empty_gauge_uses_the_voltage_trend(self):
-        start, targets = self.balance.level, None
-        for second in range(1, 21):  # charging from a strong adapter
-            targets = self.balance.update(float(second), reading(0.0, 13.0 + second * 0.002, critical=True)) or targets
-        self.assertIsNone(targets)
-        self.assertEqual(self.balance.level, start)
-        self.assertFalse(self.balance.charger_too_weak)
-        for second in range(21, 51):  # then discharging on a weak charger
-            volts = 13.04 - (second - 20) * 0.003
-            targets = self.balance.update(float(second), reading(0.0, volts, critical=True)) or targets
+    def test_draining_empty_battery_holds_the_minimum(self):
+        targets = None
+        for second in range(1, 31):
+            targets = self.feed(second, reading(0.0, 13.5 - second * 0.003, critical=True)) or targets
         self.assertEqual(targets, (12, 1200))
-        self.assertTrue(self.balance.charger_too_weak)
+        self.assertTrue(self.balance.at_minimum)
 
     def test_clock_hysteresis(self):
         self.balance.gpu_clock = 1800
@@ -497,12 +535,19 @@ class TuningTest(Fixture):
         self.tick()
         self.assertEqual(self.hw.cpu.epp, "balance_performance")
 
-    def empty_battery(self, volts_per_second):
+    def empty_battery(self, volts_per_second, seconds=25):
+        """Runs with an empty gauge, continuing from the current voltage."""
         self.sysfs.set_critical(True)
-        volts = 13.5
-        for _ in range(25):
-            volts += volts_per_second
-            self.sysfs.set_voltage(volts)
+        for _ in range(seconds):
+            self.volts += volts_per_second
+            self.sysfs.set_voltage(self.volts)
+            self.tick()
+
+    def drain(self, watts, seconds=25):
+        energy = 40.0
+        for _ in range(seconds):
+            energy -= watts / 3600
+            self.sysfs.set_energy(energy)
             self.tick()
 
     def test_weak_charger_with_an_empty_battery(self):
@@ -514,6 +559,32 @@ class TuningTest(Fixture):
         self.assertIn("charger does not cover the load", self.controller.state()["last_error"])
         self.empty_battery(0.003)  # a stronger charger
         self.assertEqual(self.controller.state()["last_error"], "")
+
+    def test_weak_charger_in_any_profile(self):
+        self.sysfs.set_source("usb-c")  # Safe, no battery balance
+        self.drain(12)
+        self.assertIn("charger does not cover the load", self.controller.state()["last_error"])
+        self.drain(-30)
+        self.assertEqual(self.controller.state()["last_error"], "")
+
+    def test_battery_balance_gets_its_chance_first(self):
+        self.sysfs.set_source("usb-c")
+        self.mode("quiet")
+        self.drain(12, seconds=20)  # draining, but the balance is still above its minimum
+        self.assertEqual(self.controller.state()["last_error"], "")
+
+    def test_rescue_sleeps_once_when_the_empty_battery_drains(self):
+        self.sysfs.set_source("usb-c")
+        self.empty_battery(-0.003, seconds=60)
+        self.assertEqual(self.sleeps, [])
+        self.empty_battery(-0.001, seconds=30)
+        self.assertEqual(self.sleeps, ["suspend"])
+        self.empty_battery(-0.001, seconds=90)
+        self.assertEqual(self.sleeps, ["suspend"])
+
+    def test_no_rescue_while_the_empty_battery_charges(self):
+        self.empty_battery(0.003, seconds=120)
+        self.assertEqual(self.sleeps, [])
 
     def test_strong_adapter_with_an_empty_battery(self):
         self.mode("quiet")

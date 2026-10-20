@@ -193,18 +193,26 @@ manual clock controls are disabled in Quiet Gaming.
 
 When the battery is empty its gauge reads 0 Wh; the controller then follows
 the trend of the battery voltage and holds its lowest level while it falls.
-If the battery drains even at the lowest level, the status line reports that
-the charger does not cover the load. Take this seriously: the firmware still
-reports external power and "Charging", so the desktop's low-battery
-suspend or shutdown does not trigger. After such a deep discharge on USB-C
+
+### Battery watch
+
+In every profile the daemon measures the battery on external power from its
+stored energy, not from the firmware's status. When the battery drains
+although nothing can lower the load further (any profile but Quiet Gaming,
+or Quiet Gaming at its lowest level), the status line reports that the
+charger does not cover the load. When this goes on for a minute with a
+critical battery, the daemon hibernates the system, or suspends it when
+hibernation is not set up; asleep, even a weak input recharges the battery.
+The desktop's own low-battery action cannot do this here: the firmware still
+reports external power and "Charging". After such a deep discharge on USB-C
 the embedded controller latched into throttling the CPU to about 600 MHz and
 limiting the USB-C input; a reboot cleared the throttling, but only an EC
 reset (power off, unplug, hold the power button for 30-40 s) restored
 charging. See [`docs/FINDINGS.md`](docs/FINDINGS.md).
 
-`px13ctl state` reports the controller under `battery_balance`
-(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`,
-`battery_draining`) and reports the detected power source under `power_source`
+`px13ctl state` reports the measurement under `battery` (`net_w`,
+`draining`, `critical`) and the controller under `battery_balance`
+(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`) and reports the detected power source under `power_source`
 (`battery`, `usb-c` or `adapter`).
 
 ### USB-C PD detection

@@ -175,19 +175,26 @@ zegarów są w Quiet Gaming wyłączone.
 
 Przy pustej baterii jej wskaźnik pokazuje 0 Wh; regulator kieruje się wtedy
 trendem napięcia baterii i trzyma najniższy poziom, dopóki napięcie spada.
-Jeśli bateria traci energię nawet na najniższym poziomie, linia statusu
-informuje, że ładowarka nie pokrywa poboru. Warto to traktować poważnie:
-firmware dalej zgłasza zasilanie zewnętrzne i „Charging”, więc pulpit nie
-uśpi ani nie wyłączy laptopa przy niskiej baterii. Po takim głębokim
+
+### Nadzór baterii
+
+W każdym profilu daemon mierzy baterię na zasilaniu zewnętrznym na podstawie
+zgromadzonej energii, a nie statusu firmware. Gdy bateria traci energię, a
+obciążenia nie da się już obniżyć (każdy profil poza Quiet Gaming albo Quiet
+Gaming na najniższym poziomie), linia statusu informuje, że ładowarka nie
+pokrywa poboru. Jeśli trwa to minutę przy krytycznej baterii, daemon
+hibernuje system, a gdy hibernacja nie jest skonfigurowana — usypia go; w
+uśpieniu nawet słabe zasilanie doładuje baterię. Pulpit sam tego nie zrobi:
+firmware dalej zgłasza zasilanie zewnętrzne i „Charging”. Po takim głębokim
 rozładowaniu na USB-C kontroler EC zatrzasnął się w dławieniu CPU do ok. 600
 MHz i ograniczaniu poboru z USB-C; restart zdjął dławienie, ale ładowanie
 przywrócił dopiero reset EC (wyłączenie, odłączenie zasilania, przytrzymanie
 przycisku zasilania przez 30-40 s). Szczegóły w
 [`docs/FINDINGS.md`](docs/FINDINGS.md).
 
-`px13ctl state` pokazuje regulator pod kluczem `battery_balance`
-(`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`, `battery_net_w`,
-`battery_draining`) oraz wykryte źródło zasilania pod `power_source`
+`px13ctl state` pokazuje pomiar pod kluczem `battery` (`net_w`, `draining`,
+`critical`), a regulator pod `battery_balance` (`level_percent`,
+`cpu_spl_w`, `gpu_clock_limit_mhz`) oraz wykryte źródło zasilania pod `power_source`
 (`battery`, `usb-c` albo `adapter`).
 
 ### Wykrywanie USB-C PD

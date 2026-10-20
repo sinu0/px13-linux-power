@@ -24,6 +24,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .balance import BatteryBalance
+from .battery import BatteryMonitor
 from .config import REQUIREMENTS, Range, describe_missing
 from .hardware import HardwareError
 from .nvidia import NvidiaError, nvpcf_policy, write_nvpcf_override
@@ -31,7 +32,11 @@ from .nvidia import NvidiaError, nvpcf_policy, write_nvpcf_override
 STATE_FILE = Path("/var/lib/px13-powerd/state.json")
 NVPCF_OVERRIDE_FILE = Path("/run/px13-powerd/nvpcf-override.conf")
 GPU_KEYS = ("gpu_tgp_offset", "gpu_dynamic_boost", "gpu_thermal_target")
-CHARGER_TOO_WEAK = "The charger does not cover the load: the battery drains even at the lowest limits"
+CHARGER_TOO_WEAK = "The battery drains on external power: the charger does not cover the load"
+# A critical battery that keeps draining on external power puts the system to
+# sleep after this long. The firmware still reports external power and
+# "Charging" then, so the desktop's own low-battery action does not trigger.
+RESCUE_DELAY_S = 60
 # asusd reapplies fan curves and cached tuning asynchronously after a mode
 # change. Waiting lets the controller's WMI budget be the final write.
 ASUSD_SETTLE_S = 2
@@ -72,6 +77,9 @@ class Controller:
         self.overrides = {}  # profile -> manual CPU/GPU values, persisted
         self.nvpcf = {}
         self.balance = None
+        self.monitor = BatteryMonitor()
+        self._weak_since = None  # critical and draining on external power
+        self._rescued = False
         self.gpu_offsets = (0, 0)
         self.gpu_clock_limit = 0
         # The driver's clock state is unknown at startup. A reset is deferred
@@ -389,16 +397,7 @@ class Controller:
 
     def _balance_step(self, now):
         """Applies the CPU target; returns a GPU clock limit to apply, or None."""
-        battery = self.hw.supplies.battery()
-        if battery is None:
-            return None
-        targets = self.balance.update(now, battery)
-        weak = self.balance.charger_too_weak
-        if weak != (self.last_error == CHARGER_TOO_WEAK):
-            self.last_error = CHARGER_TOO_WEAK if weak else ""
-            if weak:
-                self.log.warning(CHARGER_TOO_WEAK)
-            self._notify()
+        targets = self.balance.update(now, self.monitor)
         if targets is None:
             return None
         spl, clock = targets
@@ -412,19 +411,54 @@ class Controller:
             self.log.error(self.last_error)
         return clock if self.balance.wants_clock(clock) and self._clock_ranges() else None
 
+    def _watch_battery(self, now):
+        """Measures the battery on external power; returns a balance clock limit or None.
+
+        Warns when the battery drains although nothing can lower the load
+        further, and arms the rescue when that happens at a critical level.
+        """
+        battery = None if self.source == "battery" else self.hw.supplies.battery()
+        if battery is None:
+            self.monitor.forget()
+            self._weak_since = None
+            return None
+        self.monitor.update(now, battery)
+        clock = self._balance_step(now) if self.balance is not None else None
+        weak = self.monitor.draining and (self.balance is None or self.balance.at_minimum)
+        if weak != (self.last_error == CHARGER_TOO_WEAK):
+            self.last_error = CHARGER_TOO_WEAK if weak else ""
+            if weak:
+                self.log.warning(CHARGER_TOO_WEAK)
+            self._notify()
+        if not battery.critical:
+            self._rescued = False
+        self._weak_since = (self._weak_since or now) if weak and battery.critical else None
+        return clock
+
+    def _rescue_due(self, now):
+        if self._rescued or self._weak_since is None or now - self._weak_since < RESCUE_DELAY_S:
+            return False
+        self._rescued = True
+        return True
+
+    def _rescue(self):
+        """Puts the system to sleep, where even a weak input recharges the battery."""
+        try:
+            action = self.hw.sleep_system()
+        except HardwareError as error:
+            self.log.error("critical battery rescue failed: %s", error)
+        else:
+            self.log.warning("battery critical and draining on external power: %s", action)
+
     def guard_tick(self):
-        """Runs once a second: follows the mode and conditions, runs the battery balance."""
+        """Runs once a second: follows the mode and conditions, watches the battery."""
         self.evaluate()
         with self.lock:
             if self.holding or self._pending or self._busy:
                 return
             now = self._now()
-            clock = None
-            if self.balance is not None:
-                if self.source != "battery":
-                    clock = self._balance_step(now)
-                else:
-                    self.balance.forget()
+            clock = self._watch_battery(now)
+            rescue = self._rescue_due(now)
             balance = self.balance
             reset_due = self._clock_reset_pending and (
                 self._clock_reset_time is None or now - self._clock_reset_time >= CLOCK_RESET_RETRY_S
@@ -438,6 +472,8 @@ class Controller:
                 balance.gpu_clock = clock
         if reset_due:
             self._reset_clocks()
+        if rescue:
+            self._rescue()
 
     def _hold_default(self, reason):
         with self.lock:
@@ -692,6 +728,7 @@ class Controller:
                 "lid_open": conditions["lid_open"],
                 "cpu_boost": self.hw.cpu.boost_active(),
                 "holding_default": self.holding,
+                "battery": self.monitor.to_json(),
                 "battery_balance": None if self.balance is None else self.balance.to_json(),
                 "nvpcf_override": self.nvpcf,
                 "wmi": wmi,

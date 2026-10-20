@@ -63,6 +63,20 @@ def dmi_identity():
     return read_text(SYS_VENDOR), read_text(BOARD_NAME)
 
 
+def sleep_system():
+    """Hibernates when the system supports it, otherwise suspends; returns which."""
+    ok, output = run(
+        ["/usr/bin/busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+         "org.freedesktop.login1.Manager", "CanHibernate"],
+        timeout=5,
+    )
+    action = "hibernate" if ok and '"yes"' in output else "suspend"
+    ok, detail = run(["/usr/bin/systemctl", action], timeout=30)
+    if not ok:
+        raise HardwareError(f"{action} failed: {detail}")
+    return action
+
+
 def platform_profile(path=PLATFORM_PROFILE):
     """The mode chosen with Fn+F5, asusd or ROG Control Center, e.g. "balanced"."""
     return read_text(path)
