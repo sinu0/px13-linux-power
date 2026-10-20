@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Linux interfaces: sysfs, the WMI kernel module and asusctl.
+"""Linux interfaces: sysfs and the WMI kernel module.
 
 Nothing here decides policy; every function reads or writes one thing.
 """
@@ -9,6 +9,7 @@ from pathlib import Path
 
 SYS_VENDOR = Path("/sys/class/dmi/id/sys_vendor")
 BOARD_NAME = Path("/sys/class/dmi/id/board_name")
+PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
 POWER_SUPPLIES = Path("/sys/class/power_supply")
 LIDS = Path("/proc/acpi/button/lid")
 HWMON = Path("/sys/class/hwmon")
@@ -61,10 +62,9 @@ def dmi_identity():
     return read_text(SYS_VENDOR), read_text(BOARD_NAME)
 
 
-def set_asus_profile(profile):
-    ok, detail = run(["/usr/bin/asusctl", "profile", "set", profile], timeout=10)
-    if not ok:
-        raise HardwareError(f"ASUS profile {profile} failed: {detail}")
+def platform_profile(path=PLATFORM_PROFILE):
+    """The mode chosen with Fn+F5, asusd or ROG Control Center, e.g. "balanced"."""
+    return read_text(path)
 
 
 class PowerSupplies:

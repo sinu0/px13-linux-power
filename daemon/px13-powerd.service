@@ -41,11 +41,7 @@ SystemCallArchitectures=native
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
 IPAddressDeny=any
 UMask=0077
-# GPU offsets discover the current Xwayland authority file at request time.
-# Bind the runtime parent optionally: a user session does not exist during
-# early boot, while a fixed /run/user/1000 path makes the service fail.
-ProtectHome=tmpfs
-BindReadOnlyPaths=-/run/user
+ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/sys/module/px13_tgp_probe/parameters /sys/devices/system/cpu/cpufreq /sys/devices/system/cpu/amd_pstate /var/lib/px13-powerd /run/px13-powerd
 

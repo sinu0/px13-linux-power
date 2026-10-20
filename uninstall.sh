@@ -11,9 +11,7 @@ INSTALL_STATE="$STATE_DIR/install-state"
     exit 1
 }
 
-if [ -x /usr/local/bin/px13ctl ]; then
-    /usr/local/bin/px13ctl default >/dev/null 2>&1 || true
-fi
+# Stopping the service applies Safe before it exits.
 systemctl disable --now px13-powerd.service >/dev/null 2>&1 || true
 systemctl stop nvidia-powerd.service >/dev/null 2>&1 || true
 modprobe -r px13_tgp_probe >/dev/null 2>&1 || true

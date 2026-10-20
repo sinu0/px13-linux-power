@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Model description and profiles.
+"""Model description, profiles and modes.
 
 A model file describes one verified laptop: the firmware ranges the daemon may
-write and its stock profiles. Files in the profiles.d directory may add or
-change profiles and the conditions for manual tuning, so personal policies
-stay out of the defaults.
+write, its stock profiles and which profiles each platform profile (mode) uses.
+Files in the profiles.d directory may change modes, add or change profiles and
+set the conditions for manual tuning, so personal policies stay out of the
+defaults.
 """
 
 import tomllib
@@ -20,7 +21,7 @@ REQUIREMENTS = {
 }
 
 # Profile keys that may differ while running from the battery.
-BATTERY_KEYS = {"asus_profile", "cpu_epp"}
+BATTERY_KEYS = {"cpu_epp"}
 
 
 class ConfigError(ValueError):
@@ -71,10 +72,6 @@ class GpuLimits:
     tgp_offset: Range  # W on top of the firmware base TGP
     dynamic_boost: Range
     temperature: Range
-    default_tgp_w: int  # NVIDIA default limit, used before the VBIOS is queried
-    core_offset: Range
-    memory_offset: Range
-    clock_limit: Range  # 0 always means the driver default
 
 
 @dataclass(frozen=True)
@@ -86,8 +83,7 @@ class BalanceLimits:
 @dataclass(frozen=True)
 class Profile:
     name: str
-    asus_profile: str
-    platform_mode: int
+    platform_mode: int  # firmware thermal policy written with the budget
     gpu_tgp_offset: int
     gpu_dynamic_boost: int
     gpu_thermal_target: int
@@ -107,7 +103,8 @@ class Model:
     sys_vendor: str
     board_name: str
     default_profile: str
-    profiles: dict  # name -> Profile, in display order
+    profiles: dict  # name -> Profile
+    modes: dict  # platform profile -> profile names, first usable wins
     tuning_requires: frozenset
     cpu: CpuLimits
     gpu: GpuLimits
@@ -148,10 +145,11 @@ def _read(path):
 
 
 def _merge(data, overlay, path):
-    """Overlays may change manual tuning and add or change profiles, key by key."""
-    unknown = set(overlay) - {"tuning", "profiles"}
+    """Overlays may change modes and manual tuning, and add or change profiles key by key."""
+    unknown = set(overlay) - {"modes", "tuning", "profiles"}
     if unknown:
-        raise ConfigError(f"{path}: only [tuning] and [profiles.*] may be overridden, not {sorted(unknown)}")
+        raise ConfigError(f"{path}: only [modes], [tuning] and [profiles.*] may be overridden, not {sorted(unknown)}")
+    data.setdefault("modes", {}).update(overlay.get("modes", {}))
     data.setdefault("tuning", {}).update(overlay.get("tuning", {}))
     profiles = data.setdefault("profiles", {})
     for name, values in overlay.get("profiles", {}).items():
@@ -181,7 +179,6 @@ def _profile(name, data, model_limits, path):
     try:
         profile = Profile(
             name=name,
-            asus_profile=data.pop("asus_profile"),
             platform_mode=data.pop("platform_mode"),
             gpu_tgp_offset=data.pop("gpu_tgp_offset"),
             gpu_dynamic_boost=data.pop("gpu_dynamic_boost"),
@@ -215,13 +212,7 @@ def _parse(data, path):
         gpu = data["gpu"]
         cpu = CpuLimits(*(_range(data["cpu"][key], f"{path}: cpu.{key}") for key in ("sustained", "slow", "fast")))
         gpu_limits = GpuLimits(
-            tgp_offset=_range(gpu["tgp_offset"], f"{path}: gpu.tgp_offset"),
-            dynamic_boost=_range(gpu["dynamic_boost"], f"{path}: gpu.dynamic_boost"),
-            temperature=_range(gpu["temperature"], f"{path}: gpu.temperature"),
-            default_tgp_w=gpu["default_tgp_w"],
-            core_offset=_range(gpu["core_offset"], f"{path}: gpu.core_offset"),
-            memory_offset=_range(gpu["memory_offset"], f"{path}: gpu.memory_offset"),
-            clock_limit=_range(gpu["clock_limit"], f"{path}: gpu.clock_limit"),
+            *(_range(gpu[key], f"{path}: gpu.{key}") for key in ("tgp_offset", "dynamic_boost", "temperature"))
         )
         balance = BalanceLimits(
             cpu_spl=_range(data["battery_balance"]["cpu_spl"], f"{path}: battery_balance.cpu_spl"),
@@ -237,6 +228,7 @@ def _parse(data, path):
             board_name=data["match"]["board_name"],
             default_profile=data["default_profile"],
             profiles=profiles,
+            modes={mode: tuple(names) for mode, names in data["modes"].items()},
             tuning_requires=_requirements(data.get("tuning", {}).get("requires", []), f"{path}: tuning"),
             cpu=cpu,
             gpu=gpu_limits,
@@ -247,4 +239,8 @@ def _parse(data, path):
     default = model.profiles.get(model.default_profile)
     if default is None or default.requires:
         raise ConfigError(f"{path}: default profile {model.default_profile!r} must exist and have no requirements")
+    for mode, names in model.modes.items():
+        unknown = [name for name in names if name not in model.profiles]
+        if unknown:
+            raise ConfigError(f"{path}: mode {mode!r} uses unknown profiles {unknown}")
     return model

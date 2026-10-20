@@ -1,38 +1,25 @@
 # SPDX-License-Identifier: MIT
-"""NVIDIA driver interfaces: nvidia-smi, nvidia-settings and nvidia-powerd.
+"""NVIDIA driver interfaces: NVML and nvidia-powerd.
 
-Any NVML client (nvidia-smi, nvidia-settings) resumes a runtime-suspended
-dGPU from D3cold and keeps it awake for tens of seconds, so callers check
-suspended() first where waking it is not needed.
+Any NVML client resumes a runtime-suspended dGPU from D3cold and keeps it
+awake for tens of seconds, so callers check suspended() first where waking it
+is not needed. NVML is opened for one operation at a time for the same reason.
 """
 
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from .hardware import read_text, run
+import pynvml
 
-SMI = "/usr/bin/nvidia-smi"
+from .hardware import HardwareError, read_text, run
+
 PCI_DEVICES = Path("/sys/bus/pci/devices")
 NVIDIA_VENDOR = "0x10de"
-# Xwayland authority files of a running desktop session: GNOME, then KDE.
-XAUTHORITY_PATTERNS = ("*/.mutter-Xwaylandauth.*", "*/xauth_*")
 
 
-def _number(value):
-    value = value.strip()
-    if value in {"", "N/A", "[N/A]"}:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def _query(fields, timeout=5):
-    ok, output = run([SMI, f"--query-gpu={fields}", "--format=csv,noheader,nounits"], timeout)
-    if not ok or not output.strip():
-        return None
-    return [_number(value) for value in output.splitlines()[0].split(",")]
+class NvidiaError(HardwareError):
+    pass
 
 
 def nvpcf_policy(default_limit, max_limit, base_tgp, profile):
@@ -71,8 +58,7 @@ def write_nvpcf_override(path, policy):
 
 
 class Nvidia:
-    def __init__(self, log):
-        self.log = log
+    def __init__(self):
         self._device = None
         self._telemetry = {}
         self._telemetry_time = 0.0
@@ -98,36 +84,58 @@ class Nvidia:
         device = self._pci_device()
         return device is not None and (device / "driver").exists()
 
+    @contextmanager
+    def _gpu(self):
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError as error:
+            raise NvidiaError(f"NVML unavailable: {error}") from error
+        try:
+            yield pynvml.nvmlDeviceGetHandleByIndex(0)
+        except pynvml.NVMLError as error:
+            raise NvidiaError(f"NVML: {error}") from error
+        finally:
+            pynvml.nvmlShutdown()
+
     def responds(self):
-        ok, output = run([SMI, "--query-gpu=name", "--format=csv,noheader"], timeout=5)
-        return ok and bool(output.strip())
+        try:
+            with self._gpu():
+                return True
+        except NvidiaError:
+            return False
 
-    def power_limits(self):
-        """Returns the VBIOS (default, maximum) power limits, or (None, None)."""
-        values = _query("power.default_limit,power.max_limit")
-        if not values or len(values) != 2 or None in values:
-            return None, None
-        return tuple(values)
+    def describe(self):
+        """Static GPU limits: VBIOS power limits in W and clock ranges in MHz."""
+        with self._gpu() as gpu:
+            memory_clock = pynvml.nvmlDeviceGetSupportedMemoryClocks(gpu)[0]
+            clocks = sorted(pynvml.nvmlDeviceGetSupportedGraphicsClocks(gpu, memory_clock))
+            return {
+                "default_power_w": pynvml.nvmlDeviceGetPowerManagementDefaultLimit(gpu) / 1000,
+                "max_power_w": pynvml.nvmlDeviceGetPowerManagementLimitConstraints(gpu)[1] / 1000,
+                "core_offset": list(pynvml.nvmlDeviceGetGpcClkMinMaxVfOffset(gpu)),
+                "memory_offset": list(pynvml.nvmlDeviceGetMemClkMinMaxVfOffset(gpu)),
+                "clock_limit": [clocks[0], clocks[-1], clocks[1] - clocks[0]],
+            }
 
-    def ceiling_limit(self):
-        ok, output = run([SMI, "-q", "-d", "POWER"], timeout=5)
-        in_ceiling = False
-        for line in output.splitlines() if ok else ():
-            if "GPU Ceiling Power Limit" in line:
-                in_ceiling = True
-            elif in_ceiling and "Current Power Limit" in line:
-                return _number(line.split(":", 1)[1].split()[0])
-        return None
+    def ceiling_w(self):
+        """The power limit the driver currently enforces."""
+        with self._gpu() as gpu:
+            return pynvml.nvmlDeviceGetEnforcedPowerLimit(gpu) / 1000
 
     def telemetry(self):
         now = time.monotonic()
         if now - self._telemetry_time < 1.0:
             return self._telemetry
         status = self.runtime_status()
-        values = None if status == "suspended" else _query(
-            "power.draw,temperature.gpu,clocks.current.graphics", timeout=2
-        )
-        power, temperature, clock = values if values and len(values) == 3 else (None, None, None)
+        power = temperature = clock = None
+        if status != "suspended":
+            try:
+                with self._gpu() as gpu:
+                    power = pynvml.nvmlDeviceGetPowerUsage(gpu) / 1000
+                    temperature = pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+                    clock = pynvml.nvmlDeviceGetClockInfo(gpu, pynvml.NVML_CLOCK_GRAPHICS)
+            except NvidiaError:
+                pass
         self._telemetry = {
             "gpu_power_w": power,
             "gpu_temperature_c": temperature,
@@ -138,44 +146,18 @@ class Nvidia:
         return self._telemetry
 
     def set_offsets(self, core, memory):
-        """Applies clock offsets through the desktop's Xwayland server."""
-        candidates = []
-        for pattern in XAUTHORITY_PATTERNS:
-            candidates.extend(Path("/run/user").glob(pattern))
-        try:
-            authority = max(candidates, key=lambda path: path.stat().st_mtime, default=None)
-        except OSError as error:
-            self.log.info("NVIDIA offsets deferred: %s", error)
-            return False
-        if authority is None:
-            self.log.info("NVIDIA offsets deferred: no Xwayland authority of a desktop session")
-            return False
-        ok, detail = run(
-            [
-                "/usr/bin/nvidia-settings",
-                "-a",
-                f"[gpu:0]/GPUGraphicsClockOffsetAllPerformanceLevels={core}",
-                "-a",
-                f"[gpu:0]/GPUMemoryTransferRateOffsetAllPerformanceLevels={memory}",
-            ],
-            timeout=5,
-            env={"DISPLAY": ":0", "XAUTHORITY": str(authority)},
-        )
-        if not ok:
-            self.log.warning("NVIDIA offset request %s/%s failed: %s", core, memory, detail)
-            return False
-        self.log.info("NVIDIA offsets applied: core %+d MHz, memory %+d MHz", core, memory)
-        return True
+        with self._gpu() as gpu:
+            pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, core)
+            pynvml.nvmlDeviceSetMemClkVfOffset(gpu, memory)
 
-    def set_clock_limit(self, limit):
-        command = [SMI, "--reset-gpu-clocks"] if limit == 0 else [SMI, f"--lock-gpu-clocks=0,{limit}"]
-        ok, detail = run(command, timeout=5)
-        if not ok:
-            self.log.warning("NVIDIA clock limit request %s failed: %s", limit, detail)
-            return False
-        self.log.info("NVIDIA GPU clock limit %s", f"applied: {limit} MHz" if limit else "reset to default")
-        return True
+    def set_clock_limit(self, minimum, limit):
+        """Caps the graphics clock at limit MHz; 0 restores the driver default."""
+        with self._gpu() as gpu:
+            if limit:
+                pynvml.nvmlDeviceSetGpuLockedClocks(gpu, minimum, limit)
+            else:
+                pynvml.nvmlDeviceResetGpuLockedClocks(gpu)
 
-    def restart_powerd(self, action):
+    def restart_powerd(self):
         run(["/usr/bin/systemctl", "reset-failed", "nvidia-powerd.service"], timeout=10)
-        return run(["/usr/bin/systemctl", action, "nvidia-powerd.service"], timeout=10)
+        return run(["/usr/bin/systemctl", "restart", "nvidia-powerd.service"], timeout=10)

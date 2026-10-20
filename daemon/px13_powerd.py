@@ -9,6 +9,7 @@ px13power.controller, which owns all policy.
 
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 import dbus
 import dbus.mainloop.glib
 import dbus.service
-from gi.repository import GLib
+from gi.repository import GLib, GLibUnix
 
 from px13power import config, hardware
 from px13power.controller import Controller, RequestError
@@ -55,10 +56,6 @@ class Service(dbus.service.Object):
     @dbus.service.method(INTERFACE, in_signature="", out_signature="s")
     def GetState(self):
         return self._reply(self.controller.state)
-
-    @dbus.service.method(INTERFACE, in_signature="s", out_signature="s")
-    def Activate(self, profile):
-        return self._reply(self.controller.activate, str(profile))
 
     @dbus.service.method(INTERFACE, in_signature="", out_signature="s")
     def Reset(self):
@@ -117,9 +114,9 @@ def main():
         supplies=hardware.PowerSupplies(),
         cpu=hardware.Cpu(),
         wmi=hardware.Wmi(),
-        nvidia=Nvidia(log),
+        nvidia=Nvidia(),
         lid_open=hardware.lid_open,
-        set_asus_profile=hardware.set_asus_profile,
+        platform_profile=hardware.platform_profile,
     )
     controller = Controller(model, hw, log)
     Service(bus, controller)
@@ -128,8 +125,26 @@ def main():
         signal_name="PrepareForSleep",
         dbus_interface="org.freedesktop.login1.Manager",
     )
+    # asusd announces platform profile changes (Fn+F5, ROG Control Center,
+    # asusctl, its own AC/battery switching); the guard would notice within a
+    # second, this makes the switch immediate.
+    bus.add_signal_receiver(
+        lambda *_: controller.evaluate(),
+        signal_name="PropertiesChanged",
+        dbus_interface="org.freedesktop.DBus.Properties",
+        bus_name="xyz.ljones.Asusd",
+        path="/xyz/ljones",
+    )
+    loop = GLib.MainLoop()
+
+    def stop():
+        controller.shutdown()
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    GLibUnix.signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, stop)
     controller.start()
-    GLib.MainLoop().run()
+    loop.run()
 
 
 if __name__ == "__main__":

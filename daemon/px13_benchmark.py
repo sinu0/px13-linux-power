@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Record a controlled GPU/CPU benchmark and always return to the default profile."""
+"""Record a controlled GPU/CPU benchmark in a mode and always restore the previous mode."""
 
 import argparse
 import csv
@@ -15,6 +15,8 @@ from pathlib import Path
 
 
 RESULTS_DIR = Path.home() / ".local/state/px13-powerd/tests"
+PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
+MODES = ("quiet", "balanced", "performance")
 HWMON_PATH = Path("/sys/class/hwmon")
 MODULE_PARAMETERS = Path("/sys/module/px13_tgp_probe/parameters")
 GPU_TEMPERATURE_GUARD_C = 88.0
@@ -28,6 +30,17 @@ def controller(*command):
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def set_mode(mode):
+    """Selects a platform profile and waits until the controller has applied it."""
+    subprocess.run(["/usr/bin/asusctl", "profile", "set", mode.capitalize()], check=True, capture_output=True)
+    for _ in range(60):
+        state = controller("state")
+        if state["mode"] == mode and not state["applying"]:
+            return state
+        time.sleep(0.5)
+    raise RuntimeError(f"the controller did not apply the {mode} mode")
 
 
 def set_module_parameter(name, value):
@@ -139,9 +152,9 @@ def stop_process(process):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a measured benchmark; the controller returns to the default profile when it ends."
+        description="Run a measured benchmark in a mode; the previous mode is restored when it ends."
     )
-    parser.add_argument("--profile", default="Gaming", help="a profile listed by `px13ctl capabilities`")
+    parser.add_argument("--mode", choices=MODES, default="performance")
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--cpu-load", action="store_true", help="add stress-ng CPU load")
     parser.add_argument(
@@ -167,9 +180,9 @@ def main():
     if args.settle_seconds < 0 or args.settle_seconds > 60:
         parser.error("--settle-seconds must be between 0 and 60")
 
-    state = controller("activate", args.profile)
-    if state["active_profile"] != args.profile:
-        raise RuntimeError("controller did not activate the requested profile")
+    previous_mode = PLATFORM_PROFILE.read_text(encoding="ascii").strip()
+    state = set_mode(args.mode)
+    profile = state["active_profile"]
     if args.gpu_focus_cpu:
         for parameter in ("cpu_spl", "cpu_sppt", "cpu_fppt"):
             set_module_parameter(parameter, 5)
@@ -178,7 +191,7 @@ def main():
         time.sleep(args.settle_seconds)
 
     RESULTS_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + args.profile.lower().replace(" ", "-")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + profile.lower().replace(" ", "-")
     csv_path = RESULTS_DIR / f"{stamp}.csv"
     metadata_path = RESULTS_DIR / f"{stamp}.json"
     benchmark_log_path = RESULTS_DIR / f"{stamp}.benchmark.log"
@@ -238,7 +251,7 @@ def main():
             )
         elif args.benchmark == "furmark":
             # Keep FurMark windowed so it cannot interfere with the active session.
-            # The parent terminates it exactly at --duration and always restores the default profile.
+            # The parent terminates it exactly at --duration and always restores the previous mode.
             benchmark, benchmark_output = start_process(
                 [
                     "/usr/bin/furmark",
@@ -322,7 +335,7 @@ def main():
                         "cpu_frequency_mhz": cpu_frequency(),
                         "cpu_fan_rpm": fans["cpu_fan_rpm"],
                         "gpu_fan_rpm": fans["gpu_fan_rpm"],
-                        "profile": args.profile,
+                        "profile": profile,
                     }
                 )
                 output.flush()
@@ -339,9 +352,9 @@ def main():
         if cpu_output is not None:
             cpu_output.close()
         try:
-            controller("default")
-        except subprocess.CalledProcessError as error:
-            print(f"px13-benchmark: unable to restore the default profile: {error}", file=sys.stderr)
+            set_mode(previous_mode)
+        except (RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"px13-benchmark: unable to restore the {previous_mode} mode: {error}", file=sys.stderr)
 
     print(csv_path)
     print(metadata_path)

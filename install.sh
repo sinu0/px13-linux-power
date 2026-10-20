@@ -62,7 +62,7 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
     command -v pacman >/dev/null 2>&1 || die "--install-deps currently supports Arch Linux only"
     pkgbase=$(cat "/usr/lib/modules/$KERNEL/pkgbase" 2>/dev/null || true)
     [ -n "$pkgbase" ] || die "cannot determine the current kernel package"
-    pacman -S --needed base-devel dkms python-dbus python-gobject nvidia-utils asusctl \
+    pacman -S --needed base-devel dkms python-dbus python-gobject python-nvidia-ml-py nvidia-utils asusctl \
         "${pkgbase}-headers"
 fi
 
@@ -72,8 +72,8 @@ for command in cc dkms make modprobe nvidia-smi python3 systemctl; do
 done
 [ -d "/lib/modules/$KERNEL/build" ] ||
     die "kernel headers for $KERNEL are missing"
-python3 -c 'import dbus, gi' >/dev/null 2>&1 ||
-    die "Python dbus/gi modules are missing"
+python3 -c 'import dbus, gi, pynvml' >/dev/null 2>&1 ||
+    die "Python dbus, gi or pynvml (python-nvidia-ml-py) modules are missing"
 # Only systems with a verified model file are supported; this also validates
 # any personal profiles in /etc/px13-powerd/profiles.d.
 python3 "$ROOT/daemon/px13_powerd.py" --check ||
@@ -175,14 +175,12 @@ systemctl enable nvidia-powerd.service >/dev/null 2>&1 || true
 systemctl start nvidia-powerd.service
 systemctl start asusd.service
 systemctl enable --now px13-powerd.service
-sleep 8
-/usr/local/bin/px13ctl default >/dev/null
 systemctl is-active --quiet asusd.service || die "asusd failed to start"
 systemctl is-active --quiet nvidia-powerd.service || die "nvidia-powerd failed to start"
 systemctl is-active --quiet px13-powerd.service || die "px13-powerd failed to start"
 
 SUCCESS=1
-printf 'PX13 Linux Power %s installed. The machine is in the default profile.\n' "$PROJECT_VERSION"
+printf 'PX13 Linux Power %s installed. Limits follow the platform profile (Fn+F5).\n' "$PROJECT_VERSION"
 printf 'Run: px13ctl state; sudo ./scripts/doctor.sh\n'
 printf 'Personal profiles: see examples/profiles.d and /etc/px13-powerd/profiles.d.\n'
 if ! grep -q '^DynamicPowerManagement: 2$' /proc/driver/nvidia/params 2>/dev/null; then

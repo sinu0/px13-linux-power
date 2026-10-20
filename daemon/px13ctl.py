@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Command-line client for px13-powerd."""
+"""Command-line client for px13-powerd.
+
+The mode is the platform profile: switch it with Fn+F5, ROG Control Center or
+`asusctl profile set`.
+"""
 
 import argparse
 import json
@@ -28,19 +32,11 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for name, (_, help_text) in COMMANDS.items():
         commands.add_parser(name, help=help_text)
-    commands.add_parser("activate", help="switch to a profile").add_argument("profile")
-    commands.add_parser("default", help="switch to the default (safe) profile")
     args = parser.parse_args()
 
     controller = dbus.Interface(dbus.SystemBus().get_object(BUS_NAME, OBJECT_PATH), INTERFACE)
     try:
-        if args.command == "activate":
-            result = controller.Activate(args.profile)
-        elif args.command == "default":
-            capabilities = json.loads(str(controller.GetCapabilities()))
-            result = controller.Activate(capabilities["default_profile"])
-        else:
-            result = getattr(controller, COMMANDS[args.command][0])()
+        result = getattr(controller, COMMANDS[args.command][0])()
     except dbus.exceptions.DBusException as error:
         sys.exit(f"px13ctl: {error.get_dbus_message()}")
     print(json.dumps(json.loads(str(result)), indent=2, sort_keys=True))

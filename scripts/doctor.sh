@@ -37,6 +37,8 @@ check 'DKMS installed for running kernel' sh -c \
 check 'asusd active' systemctl is-active --quiet asusd.service
 check 'px13-powerd active' systemctl is-active --quiet px13-powerd.service
 check 'nvidia-powerd active' systemctl is-active --quiet nvidia-powerd.service
+check 'asusd platform_profile_linked_epp off' sh -c \
+    "busctl get-property xyz.ljones.Asusd /xyz/ljones xyz.ljones.Platform PlatformProfileLinkedEpp | grep -q false"
 check 'power-profiles-daemon inactive' sh -c \
     '! systemctl is-active --quiet power-profiles-daemon.service'
 check 'NVPCF preload installed' test -r \

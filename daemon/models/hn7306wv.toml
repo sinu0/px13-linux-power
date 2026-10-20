@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 #
 # ASUS ProArt PX13 HN7306WV with an RTX 4060 Laptop GPU, BIOS 316.
-# Every range here was verified on this board; see docs/FINDINGS.md. A new
-# model needs its own file and its own DMI entry in the kernel module.
+# Every range here was verified on this board; see docs/FINDINGS.md. GPU clock
+# ranges and power limits come from the NVIDIA driver at runtime. A new model
+# needs its own file and its own DMI entry in the kernel module.
 
 name = "PX13 Power"
 default_profile = "Safe"
@@ -22,18 +23,19 @@ fast = { min = 5, max = 65 }
 tgp_offset = { min = 0, max = 40 }
 dynamic_boost = { min = 5, max = 25 }
 temperature = { min = 75, max = 87 }
-# NVIDIA default power limit of this GPU, used until the VBIOS is queried.
-default_tgp_w = 80
-# Ranges the NVIDIA driver advertises for this GPU. They are capability
-# bounds, not stability recommendations.
-core_offset = { min = -1000, max = 1000 }
-memory_offset = { min = -2000, max = 6000 }
-clock_limit = { min = 210, max = 3105, step = 15 }
 
 # Outputs of the Quiet Gaming battery balance controller.
 [battery_balance]
 cpu_spl = { min = 12, max = 25 }
 gpu_clock = { min = 1200, max = 2400 }
+
+# The platform profile (Fn+F5, ROG Control Center, asusctl, or asusd's own
+# switching on AC and battery) selects the mode. Each mode uses the first of
+# its profiles whose requirements hold, otherwise the default profile.
+[modes]
+quiet = ["Quiet Gaming"]
+balanced = ["Safe"]
+performance = ["Gaming"]
 
 # Conditions for changing limits by hand. Personal policies belong in
 # /etc/px13-powerd/profiles.d, see examples/profiles.d.
@@ -44,7 +46,6 @@ requires = ["ac"]
 # GPU clock limit are opt-in through manual tuning.
 
 [profiles.Safe]
-asus_profile = "Balanced"
 platform_mode = 0
 gpu_tgp_offset = 10
 gpu_dynamic_boost = 5
@@ -54,18 +55,14 @@ cpu = [15, 20, 25]
 # Safe relies on PPT and EPP rather than a frequency cap. A fixed cap made
 # short interactive bursts slower without saving energy.
 cpu_epp = "balance_power"
-# asusd links Quiet to the same EPP; setting it here keeps the controller the
-# final writer.
-on_battery = { asus_profile = "Quiet", cpu_epp = "power" }
+on_battery = { cpu_epp = "power" }
 
 [profiles."Quiet Gaming"]
 # Gaming on the Quiet fan curve that also fits a 100 W USB-C PD charger: on
 # external power the battery balance controller trades CPU PPT and the GPU
 # clock ceiling to keep the battery gently charging. It stays within the Safe
-# GPU envelope, so it needs no conditions and is restored after suspend and
-# daemon restarts.
+# GPU envelope, so it needs no conditions.
 battery_balance = true
-asus_profile = "Quiet"
 platform_mode = 0
 gpu_tgp_offset = 0
 gpu_dynamic_boost = 5
@@ -75,7 +72,6 @@ cpu_epp = "balance_performance"
 
 [profiles.Gaming]
 requires = ["ac"]
-asus_profile = "Performance"
 platform_mode = 1
 gpu_tgp_offset = 25
 gpu_dynamic_boost = 15

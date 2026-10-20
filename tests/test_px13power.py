@@ -21,6 +21,7 @@ from px13power.controller import Controller, RequestError  # noqa: E402
 from px13power.nvidia import nvpcf_policy  # noqa: E402
 
 MODELS = ROOT / "daemon" / "models"
+EXAMPLE = ROOT / "examples" / "profiles.d" / "120w.toml"
 DMI = ("ASUSTeK COMPUTER INC.", "HN7306WV")
 LOG = logging.getLogger("test")
 LOG.addHandler(logging.NullHandler())
@@ -32,14 +33,22 @@ def write(path, value):
     path.write_text(f"{value}\n")
 
 
+def load_model(*overlays):
+    with tempfile.TemporaryDirectory() as overlay_dir:
+        for overlay in overlays:
+            shutil.copy(overlay, overlay_dir)
+        return config.load(MODELS, overlay_dir, *DMI)
+
+
 class Sysfs:
-    """A writable fake of the power supply, lid and WMI parameter trees."""
+    """A writable fake of the power supply, lid, platform profile and WMI trees."""
 
     def __init__(self, root):
         self.root = Path(root)
         self.supplies = self.root / "power_supply"
         self.lids = self.root / "lid"
         self.wmi = self.root / "wmi"
+        self.platform_profile = self.root / "platform_profile"
         write(self.supplies / "AC0" / "type", "Mains")
         write(self.supplies / "BAT0" / "type", "Battery")
         write(self.supplies / "BAT0" / "status", "Discharging")
@@ -54,6 +63,7 @@ class Sysfs:
         write(self.wmi / "gpu_base_tgp", 55)
         self.set_source("adapter")
         self.set_lid(True)
+        self.set_mode("balanced")
 
     def set_source(self, source):
         write(self.supplies / "AC0" / "online", int(source != "battery"))
@@ -62,35 +72,45 @@ class Sysfs:
     def set_lid(self, is_open):
         write(self.lids / "LID" / "state", "state:      " + ("open" if is_open else "closed"))
 
-    def wmi_value(self, name):
-        return int((self.wmi / name).read_text())
+    def set_mode(self, mode):
+        write(self.platform_profile, mode)
+
+    def set_energy(self, wh):
+        write(self.supplies / "BAT0" / "energy_now", int(wh * 1_000_000))
 
 
 class FakeNvidia:
     def __init__(self, maximum=120):
-        self.limits = (80.0, float(maximum))
-        self.clock_limit = 0
+        self.maximum = maximum
+        self.sleeping = False
+        self.restarts = 0
         self.offsets = (0, 0)
+        self.clock_limit = 0
 
     def suspended(self):
-        return False
+        return self.sleeping
 
-    def power_limits(self):
-        return self.limits
+    def describe(self):
+        return {
+            "default_power_w": 80.0,
+            "max_power_w": float(self.maximum),
+            "core_offset": [-1000, 1000],
+            "memory_offset": [-2000, 6000],
+            "clock_limit": [210, 3105, 15],
+        }
 
-    def ceiling_limit(self):
+    def ceiling_w(self):
         return None
 
-    def restart_powerd(self, action):
+    def restart_powerd(self):
+        self.restarts += 1
         return True, ""
 
     def set_offsets(self, core, memory):
         self.offsets = (core, memory)
-        return True
 
-    def set_clock_limit(self, limit):
+    def set_clock_limit(self, minimum, limit):
         self.clock_limit = limit
-        return True
 
     def telemetry(self):
         return {}
@@ -136,20 +156,16 @@ class Fixture(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
         self.sysfs = Sysfs(self.tmp / "sys")
-        overlay_dir = self.tmp / "profiles.d"
-        overlay_dir.mkdir()
-        for overlay in self.overlays:
-            shutil.copy(ROOT / overlay, overlay_dir)
-        self.model = config.load(MODELS, overlay_dir, *DMI)
-        self.asus_profiles = []
+        self.model = load_model(*self.overlays)
         self.time = 1000.0
+        self.sleep = lambda seconds: None
         self.hw = SimpleNamespace(
             supplies=hardware.PowerSupplies(self.sysfs.supplies),
             cpu=FakeCpu(),
             wmi=hardware.Wmi(self.sysfs.wmi),
             nvidia=FakeNvidia(self.vbios_max),
             lid_open=lambda: hardware.lid_open(self.sysfs.lids),
-            set_asus_profile=self.asus_profiles.append,
+            platform_profile=lambda: hardware.platform_profile(self.sysfs.platform_profile),
         )
         self.controller = self.new_controller()
 
@@ -160,34 +176,42 @@ class Fixture(unittest.TestCase):
             LOG,
             state_file=self.tmp / "state.json",
             nvpcf_file=self.tmp / "nvpcf.conf",
-            sleep=lambda seconds: None,
+            sleep=lambda seconds: self.sleep(seconds),
             now=lambda: self.time,
         )
-        with controller.lock:
-            controller._fallback("test start")
-            controller._restore_requested()
+        self.settle(controller)
         return controller
+
+    def settle(self, controller=None):
+        controller = controller or self.controller
+        controller.evaluate()
+        controller.wait_idle()
 
     def tick(self, seconds=1):
         self.time += seconds
         self.controller.guard_tick()
+        self.controller.wait_idle()
+
+    def mode(self, mode):
+        self.sysfs.set_mode(mode)
+        self.settle()
+        return self.controller.profile
 
 
 class ConfigTest(unittest.TestCase):
     def test_stock_model(self):
-        model = config.load(MODELS, "/nonexistent", *DMI)
+        model = load_model()
         self.assertEqual(list(model.profiles), ["Safe", "Quiet Gaming", "Gaming"])
+        self.assertEqual(model.modes["performance"], ("Gaming",))
         self.assertEqual(model.tuning_requires, {"ac"})
         self.assertFalse(model.requires_cooling_confirmation)
         safe = model.profiles["Safe"]
-        self.assertEqual(safe.for_source("battery").asus_profile, "Quiet")
-        self.assertEqual(safe.for_source("adapter").asus_profile, "Balanced")
+        self.assertEqual(safe.for_source("battery").cpu_epp, "power")
+        self.assertEqual(safe.for_source("adapter").cpu_epp, "balance_power")
 
     def test_example_overlay_adds_personal_policy(self):
-        with tempfile.TemporaryDirectory() as overlay_dir:
-            shutil.copy(ROOT / "examples/profiles.d/120w.toml", overlay_dir)
-            model = config.load(MODELS, overlay_dir, *DMI)
-        self.assertEqual(list(model.profiles), ["Safe", "Quiet Gaming", "Gaming", "120W"])
+        model = load_model(EXAMPLE)
+        self.assertEqual(model.modes["performance"], ("120W", "Gaming"))
         self.assertEqual(model.profiles["Gaming"].requires, {"adapter", "lid_open"})
         self.assertEqual(model.profiles["Gaming"].gpu_tgp_offset, 25)
         self.assertTrue(model.requires_cooling_confirmation)
@@ -203,9 +227,10 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("unknown requirements", self.overlay_error('[tuning]\nrequires = ["moon"]'))
         self.assertIn("cpu must fit", self.overlay_error("[profiles.Gaming]\ncpu = [60, 45, 55]"))
         self.assertIn("outside", self.overlay_error("[profiles.Gaming]\ngpu_dynamic_boost = 40"))
-        self.assertIn("only [tuning]", self.overlay_error('[gpu]\ndefault_tgp_w = 200'))
+        self.assertIn("may be overridden", self.overlay_error("[gpu]\ntgp_offset = { min = 0, max = 90 }"))
         self.assertIn("unknown keys", self.overlay_error("[profiles.Gaming]\nturbo = true"))
         self.assertIn("default profile", self.overlay_error('[profiles.Safe]\nrequires = ["ac"]'))
+        self.assertIn("unknown profiles", self.overlay_error('[modes]\nperformance = ["Turbo"]'))
 
     def test_unsupported_system(self):
         with self.assertRaisesRegex(config.ConfigError, "no model file"):
@@ -219,7 +244,7 @@ class ConfigTest(unittest.TestCase):
 
 
 class HardwareTest(unittest.TestCase):
-    def test_power_source_and_lid(self):
+    def test_power_source_lid_and_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             sysfs = Sysfs(tmp)
             supplies = hardware.PowerSupplies(sysfs.supplies)
@@ -228,20 +253,20 @@ class HardwareTest(unittest.TestCase):
             self.assertEqual(supplies.source(), "usb-c")
             sysfs.set_source("battery")
             self.assertEqual(supplies.source(), "battery")
-            self.assertEqual(supplies.battery_energy_wh(), 50.0)
+            self.assertEqual(supplies.battery_energy_wh(), 50.0)  # not the stylus
             self.assertFalse(supplies.battery_full())
             sysfs.set_lid(False)
             self.assertFalse(hardware.lid_open(sysfs.lids))
             self.assertTrue(hardware.lid_open(Path(tmp) / "no-lid"))
+            self.assertEqual(hardware.platform_profile(sysfs.platform_profile), "balanced")
 
     def test_wmi_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             sysfs = Sysfs(tmp)
             wmi = hardware.Wmi(sysfs.wmi)
-            model = config.load(MODELS, "/nonexistent", *DMI)
-            wmi.write_power_budget(model.profiles["Gaming"])
+            wmi.write_power_budget(load_model().profiles["Gaming"])
             self.assertEqual(wmi.cpu_power(), (30, 45, 55))
-            self.assertEqual(sysfs.wmi_value("gpu_tgp"), 25)
+            self.assertEqual(wmi.read("gpu_tgp"), 25)
             self.assertEqual(wmi.base_tgp(), 55)
 
 
@@ -263,30 +288,31 @@ class NvpcfTest(unittest.TestCase):
 
 class BalanceTest(unittest.TestCase):
     def setUp(self):
-        model = config.load(MODELS, "/nonexistent", *DMI)
-        self.balance = BatteryBalance(model.balance, 15, spl=15, now=0.0)
+        self.balance = BatteryBalance(load_model().balance, 15, spl=15, now=0.0)
+
+    def test_starts_at_the_profile_limit(self):
+        self.assertEqual(self.balance.outputs(self.balance.level), (15, 0))
 
     def test_outputs_cut_cpu_before_gpu(self):
         self.assertEqual(self.balance.outputs(100), (25, 0))
-        self.assertEqual(self.balance.outputs(75), (18, 0))
         self.assertEqual(self.balance.outputs(50), (12, 0))
         self.assertEqual(self.balance.outputs(25), (12, 1800))
         self.assertEqual(self.balance.outputs(0), (12, 1200))
 
     def test_discharge_lowers_level(self):
-        energy = 50.0
-        targets = None
+        start, energy, targets = self.balance.level, 50.0, None
         for second in range(1, 31):
             energy -= 0.01  # 36 W discharge
             targets = self.balance.update(float(second), energy, battery_full=False) or targets
-        self.assertLess(self.balance.level, 70.0)
+        self.assertLess(self.balance.level, start)
         self.assertAlmostEqual(self.balance.net_power_w, -36.0, places=0)
         self.assertEqual(targets, self.balance.outputs(self.balance.level))
 
     def test_full_battery_holds_level(self):
+        start = self.balance.level
         for second in range(1, 31):
             self.assertIsNone(self.balance.update(float(second), 50.0, battery_full=True))
-        self.assertEqual(self.balance.level, 70.0)
+        self.assertEqual(self.balance.level, start)
 
     def test_clock_hysteresis(self):
         self.balance.gpu_clock = 1800
@@ -295,133 +321,200 @@ class BalanceTest(unittest.TestCase):
         self.assertTrue(self.balance.wants_clock(0))
 
 
-class StockControllerTest(Fixture):
-    def test_starts_in_default_profile(self):
-        state = self.controller.state()
-        self.assertEqual(state["active_profile"], "Safe")
-        self.assertFalse(state["controls_ready"])
-        self.assertIn("other than Safe", state["blocked_reason"])
-        self.assertEqual(self.asus_profiles[-1], "Balanced")
-        self.assertEqual(state["gpu_power"], {"base_w": 65, "boost_w": 5, "temperature_c": 80})
+class ModeTest(Fixture):
+    def test_mode_selects_profile(self):
+        self.assertEqual(self.controller.profile, "Safe")
+        self.assertEqual(self.mode("quiet"), "Quiet Gaming")
+        self.assertEqual(self.mode("performance"), "Gaming")
+        self.assertEqual(self.hw.wmi.cpu_power(), (30, 45, 55))
+        self.assertEqual(self.mode("low-power"), "Safe")  # a mode without profiles
 
-    def test_gaming_requires_external_power(self):
-        self.sysfs.set_source("battery")
-        with self.assertRaisesRegex(RequestError, "requires external power"):
-            self.controller.activate("Gaming")
-
-    def test_gaming_falls_back_when_unplugged(self):
-        self.controller.activate("Gaming")
-        self.assertTrue(self.controller.state()["controls_ready"])
-        self.sysfs.set_lid(False)  # the stock policy allows a closed lid
-        self.tick()
-        self.assertEqual(self.controller.active_profile, "Gaming")
+    def test_gaming_follows_external_power(self):
+        self.mode("performance")
         self.sysfs.set_source("battery")
         self.tick()
-        self.assertEqual(self.controller.active_profile, "Safe")
-
-    def test_safe_follows_power_source_after_debounce(self):
-        self.sysfs.set_source("battery")
-        for _ in range(3):
-            self.tick()
-        self.assertEqual(self.asus_profiles[-1], "Balanced")
-        self.tick()
-        self.assertEqual(self.asus_profiles[-1], "Quiet")
+        self.assertEqual(self.controller.profile, "Safe")
         self.assertEqual(self.hw.cpu.epp, "power")
+        self.sysfs.set_source("adapter")
+        self.tick()
+        self.assertEqual(self.controller.profile, "Gaming")
 
-    def test_cpu_tuning_is_kept_per_profile(self):
-        with self.assertRaisesRegex(RequestError, "other than Safe"):
+    def test_safe_battery_variant(self):
+        restarts = self.hw.nvidia.restarts
+        self.sysfs.set_source("battery")
+        self.tick()
+        self.assertEqual(self.hw.cpu.epp, "power")
+        self.assertEqual(self.hw.nvidia.restarts, restarts)  # no restart on battery
+        self.sysfs.set_source("adapter")
+        self.tick()
+        self.assertEqual(self.hw.cpu.epp, "balance_power")
+
+    def test_requests_return_before_the_slow_work(self):
+        self.mode("performance")
+        restarts = self.hw.nvidia.restarts
+        state = self.controller.set_gpu_power(90, 20, 84)
+        self.assertTrue(state["applying"])
+        self.assertEqual(state["gpu_power"], {"base_w": 90, "boost_w": 20, "temperature_c": 84})
+        self.controller.set_gpu_power(95, 20, 84)
+        self.controller.wait_idle()
+        self.assertEqual(self.hw.nvidia.restarts, restarts + 1)  # two changes, one restart
+        self.assertEqual(self.controller.nvpcf["max_tgp_w"], 115)
+        self.assertFalse(self.controller.state()["applying"])
+
+    def test_newer_work_supersedes_older_work(self):
+        self.mode("performance")
+        restarts = self.hw.nvidia.restarts
+        self.controller.set_gpu_power(90, 20, 84)
+        interrupted = []
+
+        def sleep(seconds):
+            if not interrupted:
+                interrupted.append(True)
+                self.controller.set_gpu_power(95, 25, 85)
+
+        self.sleep = sleep
+        self.controller.wait_idle()
+        self.assertEqual(self.hw.nvidia.restarts, restarts + 1)
+        self.assertEqual(self.controller.nvpcf["max_tgp_w"], 120)
+
+    def test_interrupted_profile_change_is_completed(self):
+        self.sysfs.set_mode("performance")
+        self.controller.evaluate()  # Gaming is chosen, the work waits for asusd
+        interrupted = []
+
+        def sleep(seconds):
+            if not interrupted:
+                interrupted.append(True)
+                self.controller.set_gpu_power(90, 20, 84)
+
+        self.sleep = sleep
+        self.controller.wait_idle()
+        self.assertEqual(self.hw.cpu.epp, "performance")
+        self.assertEqual(self.controller.nvpcf["max_tgp_w"], 110)
+
+    def test_suspend_and_shutdown_hold_the_default(self):
+        self.mode("performance")
+        self.controller.prepare_suspend("test")
+        self.assertEqual(self.controller.profile, "Safe")
+        self.assertEqual(self.mode("quiet"), "Safe")  # held while asleep
+        self.mode("performance")
+        self.controller._resume_worker()
+        self.controller.wait_idle()
+        self.assertEqual(self.controller.profile, "Gaming")
+        self.controller.shutdown()
+        self.assertEqual(self.controller.profile, "Safe")
+        self.assertEqual(self.hw.wmi.cpu_power(), (15, 20, 25))
+
+
+class TuningTest(Fixture):
+    def test_tuning_is_kept_per_profile(self):
+        with self.assertRaisesRegex(RequestError, "not available in Safe"):
             self.controller.set_cpu_power(20, 30, 40)
-        self.controller.activate("Gaming")
+        self.mode("performance")
         with self.assertRaisesRegex(RequestError, "sustained <= slow"):
             self.controller.set_cpu_power(40, 30, 40)
         state = self.controller.set_cpu_power(20, 30, 40)
         self.assertEqual(state["cpu_power"], {"sustained_w": 20, "slow_w": 30, "fast_w": 40})
-        self.controller.activate("Safe")
-        self.controller.activate("Gaming")
+        self.mode("balanced")
+        self.mode("performance")
         self.assertEqual(self.hw.wmi.cpu_power(), (20, 30, 40))
         self.controller.reset()
+        self.controller.wait_idle()
         self.assertEqual(self.hw.wmi.cpu_power(), (30, 45, 55))
 
     def test_gpu_power_validation(self):
-        self.controller.activate("Gaming")
+        self.mode("performance")
         caps = self.controller.capabilities()["gpu_power"]
         self.assertEqual(caps["base"], {"min": 55, "max": 95, "step": 1})
         self.assertEqual(caps["max_total"], 120)
         with self.assertRaisesRegex(RequestError, "120 W in total"):
             self.controller.set_gpu_power(95, 26, 85)
-        state = self.controller.set_gpu_power(90, 20, 84)
-        self.assertEqual(state["gpu_power"], {"base_w": 90, "boost_w": 20, "temperature_c": 84})
-        self.assertEqual(self.controller.nvpcf["max_tgp_w"], 110)
 
     def test_overrides_survive_restart(self):
-        self.controller.activate("Gaming")
+        self.mode("performance")
         self.controller.set_cpu_power(20, 30, 40)
         restarted = self.new_controller()
-        self.assertEqual(restarted.requested_profile, "Gaming")
-        self.assertEqual(restarted.active_profile, "Safe")  # Gaming has requirements
-        self.assertEqual(restarted.overrides["Gaming"]["cpu"], [20, 30, 40])
+        self.assertEqual(restarted.profile, "Gaming")
+        self.assertEqual(self.hw.wmi.cpu_power(), (20, 30, 40))
 
-    def test_quiet_gaming_is_restored_and_balanced(self):
-        self.controller.activate("Quiet Gaming")
-        restarted = self.new_controller()
-        self.assertEqual(restarted.active_profile, "Quiet Gaming")
-        self.controller = restarted
-        self.assertFalse(restarted.state()["clocks_enabled"])
-        # A 36 W discharge on a weak charger lowers the level by 3 % a period.
+    def test_clocks(self):
+        caps = self.controller.capabilities()["gpu_clocks"]
+        self.assertEqual(caps["limit"], {"min": 210, "max": 3105, "step": 15})
+        self.mode("performance")
+        with self.assertRaisesRegex(RequestError, "15 MHz steps"):
+            self.controller.set_gpu_clock_limit(1505)
+        self.controller.set_gpu_offsets(100, 500)
+        self.controller.set_gpu_clock_limit(1800)
+        self.assertEqual((self.hw.nvidia.offsets, self.hw.nvidia.clock_limit), ((100, 500), 1800))
+        self.mode("quiet")  # profiles never overclock
+        self.assertEqual((self.hw.nvidia.offsets, self.hw.nvidia.clock_limit), ((0, 0), 0))
+        with self.assertRaisesRegex(RequestError, "battery balance"):
+            self.controller.set_gpu_clock_limit(1800)
+
+    def test_clock_reset_waits_for_a_sleeping_gpu(self):
+        self.mode("performance")
+        self.controller.set_gpu_offsets(100, 0)
+        self.hw.nvidia.sleeping = True
+        self.mode("balanced")
+        self.assertEqual(self.hw.nvidia.offsets, (100, 0))
+        self.hw.nvidia.sleeping = False
+        self.tick(60)
+        self.assertEqual(self.hw.nvidia.offsets, (0, 0))
+
+    def test_quiet_gaming_balances_the_battery(self):
+        self.mode("quiet")
         energy = 50.0
-        for _ in range(60):
+        for _ in range(60):  # 36 W discharge on a weak charger
             energy -= 0.01
-            write(self.sysfs.supplies / "BAT0" / "energy_now", int(energy * 1_000_000))
+            self.sysfs.set_energy(energy)
             self.tick()
         self.assertLess(self.hw.wmi.cpu_power()[0], 15)
-        self.assertLess(restarted.balance.level, 60)
-
-    def test_capabilities_follow_the_vbios(self):
-        caps = self.controller.capabilities()
-        self.assertEqual(caps["profiles"], ["Safe", "Quiet Gaming", "Gaming"])
-        self.assertFalse(caps["requires_cooling_confirmation"])
 
 
 class PersonalPolicyTest(Fixture):
-    overlays = ("examples/profiles.d/120w.toml",)
+    overlays = (EXAMPLE,)
 
-    def test_lid_and_adapter_are_enforced(self):
+    def test_adapter_and_lid(self):
         self.sysfs.set_source("usb-c")
-        with self.assertRaisesRegex(RequestError, "power adapter"):
-            self.controller.activate("Gaming")
+        self.assertEqual(self.mode("performance"), "Safe")
         self.sysfs.set_source("adapter")
-        self.controller.activate("Gaming")
+        self.tick()
+        self.assertEqual(self.controller.profile, "Gaming")
         self.sysfs.set_lid(False)
         self.tick()
-        self.assertEqual(self.controller.active_profile, "Safe")
+        self.assertEqual(self.controller.profile, "Safe")
 
-    def test_120w_needs_cooling_confirmation(self):
-        with self.assertRaisesRegex(RequestError, "cooling confirmation"):
-            self.controller.activate("120W")
+    def test_cooling_confirmation_unlocks_120w(self):
+        self.mode("performance")
+        self.assertEqual(self.controller.profile, "Gaming")
+        state = self.controller.state()
+        self.assertEqual(state["blocked_reason"], "Changing limits requires cooling confirmation.")
         self.sysfs.set_lid(False)
         with self.assertRaisesRegex(RequestError, "lid open"):
             self.controller.confirm_cooling()
         self.sysfs.set_lid(True)
+        self.tick()
         self.controller.confirm_cooling()
-        state = self.controller.activate("120W")
-        self.assertEqual(state["active_profile"], "120W")
-        self.assertTrue(state["controls_ready"])
+        self.controller.wait_idle()
+        self.assertEqual(self.controller.profile, "120W")
+        self.assertTrue(self.controller.state()["controls_ready"])
         self.assertEqual(self.controller.nvpcf["max_tgp_w"], 120)
-
-    def test_tuning_requires_all_conditions(self):
-        self.controller.activate("Gaming")
-        state = self.controller.state()
-        self.assertEqual(state["blocked_reason"], "Changing limits requires cooling confirmation.")
-        with self.assertRaises(RequestError):
-            self.controller.set_gpu_offsets(100, 0)
+        self.sysfs.set_lid(False)
+        self.tick()
+        self.sysfs.set_lid(True)
+        self.tick()
+        self.assertEqual(self.controller.profile, "Gaming")  # confirmation was cleared
 
 
 class SmallVbiosTest(Fixture):
-    overlays = ("examples/profiles.d/120w.toml",)
+    overlays = (EXAMPLE,)
     vbios_max = 100
 
-    def test_120w_is_hidden(self):
-        self.assertEqual(self.controller.capabilities()["profiles"], ["Safe", "Quiet Gaming", "Gaming"])
+    def test_120w_is_skipped(self):
+        self.mode("performance")
+        self.controller.confirm_cooling()
+        self.controller.wait_idle()
+        self.assertEqual(self.controller.profile, "Gaming")
 
 
 if __name__ == "__main__":

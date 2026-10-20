@@ -20,7 +20,6 @@ MIN_WINDOW_S = 15.0
 KP = 1.0  # % per W of change in the averaged error
 KI = 0.02  # % per W*s of averaged error
 MAX_STEP = 3.0  # % per period
-START_LEVEL = 70.0
 CLOCK_HYSTERESIS_STEPS = 3
 
 
@@ -32,9 +31,11 @@ class BatteryBalance:
     def __init__(self, limits, clock_step, spl, now):
         self.limits = limits
         self.clock_step = clock_step
-        self.level = START_LEVEL
         self.spl = spl
         self.spl_ceiling = limits.cpu_spl.max
+        # Start where the profile's own sustained limit is, GPU unlimited.
+        spl_range = self.spl_ceiling - limits.cpu_spl.min
+        self.level = 50.0 + 50.0 * _share((spl - limits.cpu_spl.min) / spl_range if spl_range else 0.0)
         self.gpu_clock = 0  # 0 = no limit
         self.net_power_w = None
         self._energy = []  # (time, Wh)
