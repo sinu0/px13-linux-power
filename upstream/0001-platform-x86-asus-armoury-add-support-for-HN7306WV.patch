@@ -1,0 +1,58 @@
+From a594645481f52b8533d4fbd86a2c5fef09d317d0 Mon Sep 17 00:00:00 2001
+From: Mariusz Pacek <sinu0o@gmail.com>
+Date: Tue, 20 Oct 2026 19:32:48 +0200
+Subject: [PATCH] platform/x86: asus-armoury: add support for HN7306WV
+
+Add AC power limits for the ASUS ProArt PX13 HN7306WV (Ryzen AI 9 HX 370,
+GeForce RTX 4060 Laptop GPU). Without an entry, all ROG tunables return
+-ENODEV on this board.
+
+The ranges are those the firmware accepts through the same WMI device IDs
+on BIOS 316, verified with sustained CPU and GPU load. On this board the
+DGPU_SET_TGP value is the variable TGP added to the 55 W base reported by
+nv_base_tgp, as documented for nv_tgp, hence 0..40 W.
+
+No DC data is added: the battery limits have not been measured. On battery
+the firmware itself caps the dGPU at about 40-45 W and disables Dynamic
+Boost.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/asus-armoury.h | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/platform/x86/asus-armoury.h b/drivers/platform/x86/asus-armoury.h
+index 0e301d6..64e23f3 100644
+--- a/drivers/platform/x86/asus-armoury.h
++++ b/drivers/platform/x86/asus-armoury.h
+@@ -2472,6 +2472,27 @@ static const struct dmi_system_id power_limits[] = {
+ 			},
+ 		},
+ 	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_BOARD_NAME, "HN7306WV"),
++		},
++		.driver_data = &(struct power_data) {
++			.ac_data = &(struct power_limits) {
++				.ppt_pl1_spl_min = 5,
++				.ppt_pl1_spl_max = 45,
++				.ppt_pl2_sppt_min = 5,
++				.ppt_pl2_sppt_max = 55,
++				.ppt_pl3_fppt_min = 5,
++				.ppt_pl3_fppt_max = 65,
++				.nv_dynamic_boost_min = 5,
++				.nv_dynamic_boost_max = 25,
++				.nv_temp_target_min = 75,
++				.nv_temp_target_max = 87,
++				.nv_tgp_min = 0,
++				.nv_tgp_max = 40,
++			},
++		},
++	},
+ 	{
+ 		.matches = {
+ 			DMI_MATCH(DMI_BOARD_NAME, "RC71"),
+-- 
+2.56.0
+
