@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Record a controlled PX13 GPU/CPU benchmark and always return to Safe."""
+"""Record a controlled GPU/CPU benchmark and always return to the default profile."""
 
 import argparse
 import csv
@@ -20,9 +20,9 @@ MODULE_PARAMETERS = Path("/sys/module/px13_tgp_probe/parameters")
 GPU_TEMPERATURE_GUARD_C = 88.0
 
 
-def controller(command):
+def controller(*command):
     result = subprocess.run(
-        ["/usr/local/bin/px13ctl", command],
+        ["/usr/local/bin/px13ctl", *command],
         check=True,
         capture_output=True,
         text=True,
@@ -139,9 +139,9 @@ def stop_process(process):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a measured PX13 benchmark; the controller returns to Safe when it ends."
+        description="Run a measured benchmark; the controller returns to the default profile when it ends."
     )
-    parser.add_argument("--profile", choices=("gaming", "120w"), default="gaming")
+    parser.add_argument("--profile", default="Gaming", help="a profile listed by `px13ctl capabilities`")
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--cpu-load", action="store_true", help="add stress-ng CPU load")
     parser.add_argument(
@@ -167,15 +167,8 @@ def main():
     if args.settle_seconds < 0 or args.settle_seconds > 60:
         parser.error("--settle-seconds must be between 0 and 60")
 
-    requested_command = "120w" if args.profile == "120w" else "gaming"
-    before = controller("state")
-    if args.profile == "120w" and not before["cooling_confirmed"]:
-        parser.error(
-            "120W requires a fresh physical cooling confirmation in RCC or `px13ctl confirm-cooling`"
-        )
-
-    state = controller(requested_command)
-    if state["active_profile"] != ("120W" if args.profile == "120w" else "Gaming"):
+    state = controller("activate", args.profile)
+    if state["active_profile"] != args.profile:
         raise RuntimeError("controller did not activate the requested profile")
     if args.gpu_focus_cpu:
         for parameter in ("cpu_spl", "cpu_sppt", "cpu_fppt"):
@@ -185,11 +178,11 @@ def main():
         time.sleep(args.settle_seconds)
 
     RESULTS_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    csv_path = RESULTS_DIR / f"{stamp}-{args.profile}.csv"
-    metadata_path = RESULTS_DIR / f"{stamp}-{args.profile}.json"
-    benchmark_log_path = RESULTS_DIR / f"{stamp}-{args.profile}.benchmark.log"
-    cpu_log_path = RESULTS_DIR / f"{stamp}-{args.profile}.cpu.log"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + args.profile.lower().replace(" ", "-")
+    csv_path = RESULTS_DIR / f"{stamp}.csv"
+    metadata_path = RESULTS_DIR / f"{stamp}.json"
+    benchmark_log_path = RESULTS_DIR / f"{stamp}.benchmark.log"
+    cpu_log_path = RESULTS_DIR / f"{stamp}.cpu.log"
     metadata = {
         "profile": state,
         "duration_seconds": args.duration,
@@ -245,7 +238,7 @@ def main():
             )
         elif args.benchmark == "furmark":
             # Keep FurMark windowed so it cannot interfere with the active session.
-            # The parent terminates it exactly at --duration and always restores Safe.
+            # The parent terminates it exactly at --duration and always restores the default profile.
             benchmark, benchmark_output = start_process(
                 [
                     "/usr/bin/furmark",
@@ -346,9 +339,9 @@ def main():
         if cpu_output is not None:
             cpu_output.close()
         try:
-            controller("safe")
+            controller("default")
         except subprocess.CalledProcessError as error:
-            print(f"px13-benchmark: unable to restore Safe: {error}", file=sys.stderr)
+            print(f"px13-benchmark: unable to restore the default profile: {error}", file=sys.stderr)
 
     print(csv_path)
     print(metadata_path)

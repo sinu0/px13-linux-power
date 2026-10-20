@@ -12,7 +12,7 @@ INSTALL_STATE="$STATE_DIR/install-state"
 }
 
 if [ -x /usr/local/bin/px13ctl ]; then
-    /usr/local/bin/px13ctl safe >/dev/null 2>&1 || true
+    /usr/local/bin/px13ctl default >/dev/null 2>&1 || true
 fi
 systemctl disable --now px13-powerd.service >/dev/null 2>&1 || true
 systemctl stop nvidia-powerd.service >/dev/null 2>&1 || true
@@ -21,6 +21,7 @@ modprobe -r px13_tgp_probe >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/px13-powerd.service \
     /etc/systemd/system/nvidia-powerd.service.d/px13-nvpcf.conf \
     /etc/dbus-1/system.d/org.asuslinux.Px13Power.conf \
+    /etc/dbus-1/system.d/org.asuslinux.TuningProvider.conf \
     /etc/modules-load.d/px13-tgp.conf \
     /usr/lib/systemd/system-sleep/px13-powerd \
     /usr/local/bin/px13ctl
@@ -65,3 +66,6 @@ if [ -f "$INSTALL_STATE" ]; then
 fi
 rm -rf "$STATE_DIR"
 printf 'PX13 Linux Power removed. nvidia-powerd was restored without the override.\n'
+if [ -d /etc/px13-powerd ]; then
+    printf 'px13-linux-power: personal profiles were kept in /etc/px13-powerd.\n'
+fi

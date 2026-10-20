@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 [Unit]
-Description=ASUS ProArt PX13 power profile controller
+Description=Power profile controller for ASUS laptops (px13-linux-power)
 After=asusd.service nvidia-powerd.service systemd-modules-load.service
 Wants=asusd.service nvidia-powerd.service
 # A package update can replace the modules of the still-running kernel.  Do
@@ -13,7 +13,7 @@ StartLimitBurst=3
 
 [Service]
 Type=dbus
-BusName=org.asuslinux.Px13Power
+BusName=org.asuslinux.TuningProvider
 ExecStart=/usr/local/lib/px13-powerd/px13_powerd.py
 Restart=on-failure
 RestartSec=2

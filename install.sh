@@ -7,6 +7,7 @@ MODULE_VERSION="5.0"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
 STATE_DIR=/var/lib/px13-powerd
+LIB_DIR=/usr/local/lib/px13-powerd
 INSTALL_STATE="$STATE_DIR/install-state"
 SUCCESS=0
 
@@ -65,11 +66,6 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
         "${pkgbase}-headers"
 fi
 
-vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
-board=$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)
-[ "$vendor" = "ASUSTeK COMPUTER INC." ] && [ "$board" = "HN7306WV" ] ||
-    die "unsupported system ($vendor/$board); only ASUS HN7306WV is allowed"
-
 for command in cc dkms make modprobe nvidia-smi python3 systemctl; do
     command -v "$command" >/dev/null 2>&1 ||
         die "missing dependency: $command (see README.md)"
@@ -78,6 +74,10 @@ done
     die "kernel headers for $KERNEL are missing"
 python3 -c 'import dbus, gi' >/dev/null 2>&1 ||
     die "Python dbus/gi modules are missing"
+# Only systems with a verified model file are supported; this also validates
+# any personal profiles in /etc/px13-powerd/profiles.d.
+python3 "$ROOT/daemon/px13_powerd.py" --check ||
+    die "unsupported system or invalid configuration (see above)"
 unit_exists asusd.service || die "asusd.service is missing; install and configure asusctl"
 unit_exists nvidia-powerd.service ||
     die "nvidia-powerd.service is missing; install an NVIDIA driver with Dynamic Boost"
@@ -132,23 +132,25 @@ for build_dir in /lib/modules/*/build; do
     fi
 done
 
-install -d -m 0755 /usr/local/lib/px13-powerd \
+# The 0.1 layout installed a single script; replace the whole directory.
+rm -rf "$LIB_DIR"
+install -d -m 0755 "$LIB_DIR/px13power" "$LIB_DIR/models" /etc/px13-powerd/profiles.d \
     /etc/systemd/system/nvidia-powerd.service.d
-install -m 0755 "$ROOT/daemon/px13_powerd.py" \
-    /usr/local/lib/px13-powerd/px13_powerd.py
-install -m 0755 "$ROOT/daemon/px13_benchmark.py" \
-    /usr/local/lib/px13-powerd/px13_benchmark.py
+install -m 0755 "$ROOT/daemon/px13_powerd.py" "$ROOT/daemon/px13_benchmark.py" "$LIB_DIR/"
+install -m 0644 "$ROOT"/daemon/px13power/*.py "$LIB_DIR/px13power/"
+install -m 0644 "$ROOT"/daemon/models/*.toml "$LIB_DIR/models/"
 install -m 0755 "$ROOT/daemon/px13ctl.py" /usr/local/bin/px13ctl
 install -m 0644 "$ROOT/daemon/px13-powerd.service" \
     /etc/systemd/system/px13-powerd.service
+rm -f /etc/dbus-1/system.d/org.asuslinux.Px13Power.conf
 install -m 0644 "$ROOT/daemon/px13-powerd.conf" \
-    /etc/dbus-1/system.d/org.asuslinux.Px13Power.conf
+    /etc/dbus-1/system.d/org.asuslinux.TuningProvider.conf
 install -m 0755 "$ROOT/daemon/px13-powerd.sleep" \
     /usr/lib/systemd/system-sleep/px13-powerd
 install -m 0644 "$ROOT/daemon/px13-tgp.conf" \
     /etc/modules-load.d/px13-tgp.conf
 install -m 0644 "$ROOT/nvpcf-override/libnvpcf_override.so" \
-    /usr/local/lib/px13-powerd/libnvpcf_override.so
+    "$LIB_DIR/libnvpcf_override.so"
 install -m 0644 "$ROOT/nvpcf-override/nvidia-powerd-px13.conf" \
     /etc/systemd/system/nvidia-powerd.service.d/px13-nvpcf.conf
 
@@ -174,14 +176,15 @@ systemctl start nvidia-powerd.service
 systemctl start asusd.service
 systemctl enable --now px13-powerd.service
 sleep 8
-/usr/local/bin/px13ctl safe >/dev/null
+/usr/local/bin/px13ctl default >/dev/null
 systemctl is-active --quiet asusd.service || die "asusd failed to start"
 systemctl is-active --quiet nvidia-powerd.service || die "nvidia-powerd failed to start"
 systemctl is-active --quiet px13-powerd.service || die "px13-powerd failed to start"
 
 SUCCESS=1
-printf 'PX13 Linux Power %s installed. The machine is in Safe.\n' "$PROJECT_VERSION"
+printf 'PX13 Linux Power %s installed. The machine is in the default profile.\n' "$PROJECT_VERSION"
 printf 'Run: px13ctl state; sudo ./scripts/doctor.sh\n'
+printf 'Personal profiles: see examples/profiles.d and /etc/px13-powerd/profiles.d.\n'
 if ! grep -q '^DynamicPowerManagement: 2$' /proc/driver/nvidia/params 2>/dev/null; then
     printf 'RTD3 config installed to /etc/modprobe.d/px13-nvidia-rtd3.conf.\n'
     printf 'Regenerate the initramfs (e.g. sudo mkinitcpio -P) and reboot for it to take effect.\n'

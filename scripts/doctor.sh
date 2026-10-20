@@ -26,7 +26,8 @@ done
 vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
 board=$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)
 printf 'System: %s / %s\n' "$vendor" "$board"
-check 'supported DMI' test "$vendor/$board" = 'ASUSTeK COMPUTER INC./HN7306WV'
+check 'model file and personal profiles valid' \
+    python3 /usr/local/lib/px13-powerd/px13_powerd.py --check
 check 'px13_tgp_probe loaded' test -d /sys/module/px13_tgp_probe
 if [ -r /sys/module/px13_tgp_probe/version ]; then
     printf 'Module: %s\n' "$(cat /sys/module/px13_tgp_probe/version)"

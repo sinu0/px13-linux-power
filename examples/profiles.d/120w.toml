@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+#
+# Example personal policy: a PX13 whose VBIOS reports a 120 W maximum, used on
+# a desk with the 200 W barrel adapter. Copy it to /etc/px13-powerd/profiles.d/
+# and restart px13-powerd to enable it. The 120W profile is offered only when
+# the installed VBIOS actually reports at least 120 W.
+
+# Manual tuning only on the barrel adapter, with the lid open and after
+# confirming that the cooling is unobstructed.
+[tuning]
+requires = ["adapter", "lid_open", "cooling_confirmation"]
+
+# A 100 W USB-C PD charger cannot supply Gaming: the battery drained by about
+# 40 W in tests. Leave Gaming when the adapter is unplugged or the lid closes.
+[profiles.Gaming]
+requires = ["adapter", "lid_open"]
+
+[profiles."120W"]
+requires = ["adapter", "lid_open", "cooling_confirmation"]
+# Keep the firmware in Performance so its fan curve remains active. GPU TGP,
+# Dynamic Boost and PPT are independent WMI controls.
+asus_profile = "Performance"
+platform_mode = 1
+gpu_tgp_offset = 40
+gpu_dynamic_boost = 25
+gpu_thermal_target = 87
+# A 5 W sustained budget preserves the full 25 W Dynamic Boost, while higher
+# slow/fast limits avoid the 600 MHz floor seen at 5/5/5 W. Raising sustained
+# power trades GPU watts for CPU performance on this shared platform budget.
+cpu = [5, 25, 35]
+cpu_epp = "performance"
