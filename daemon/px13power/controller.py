@@ -33,6 +33,9 @@ STATE_FILE = Path("/var/lib/px13-powerd/state.json")
 NVPCF_OVERRIDE_FILE = Path("/run/px13-powerd/nvpcf-override.conf")
 GPU_KEYS = ("gpu_tgp_offset", "gpu_dynamic_boost", "gpu_thermal_target")
 CHARGER_TOO_WEAK = "The battery drains on external power: the charger does not cover the load"
+# A USB-C PD contract can get stuck with the input off while the firmware still
+# reports "Charging"; only a re-plug restores it (docs/FINDINGS.md).
+USB_C_HINT = ". Under a light load, re-plug the USB-C charger"
 # A critical battery that keeps draining on external power puts the system to
 # sleep after this long. The firmware still reports external power and
 # "Charging" then, so the desktop's own low-battery action does not trigger.
@@ -425,10 +428,11 @@ class Controller:
         self.monitor.update(now, battery)
         clock = self._balance_step(now) if self.balance is not None else None
         weak = self.monitor.draining and (self.balance is None or self.balance.at_minimum)
-        if weak != (self.last_error == CHARGER_TOO_WEAK):
-            self.last_error = CHARGER_TOO_WEAK if weak else ""
+        warning = CHARGER_TOO_WEAK + (USB_C_HINT if self.source == "usb-c" else "") if weak else ""
+        if (weak or self.last_error.startswith(CHARGER_TOO_WEAK)) and warning != self.last_error:
+            self.last_error = warning
             if weak:
-                self.log.warning(CHARGER_TOO_WEAK)
+                self.log.warning(warning)
             self._notify()
         if not battery.critical:
             self._rescued = False

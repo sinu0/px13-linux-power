@@ -13,10 +13,12 @@ INSTALL_STATE="$STATE_DIR/install-state"
 
 # Stopping the service applies Safe before it exits.
 systemctl disable --now px13-powerd.service >/dev/null 2>&1 || true
+systemctl --global disable px13-notify.service >/dev/null 2>&1 || true
 systemctl stop nvidia-powerd.service >/dev/null 2>&1 || true
 modprobe -r px13_tgp_probe >/dev/null 2>&1 || true
 
 rm -f /etc/systemd/system/px13-powerd.service \
+    /etc/systemd/user/px13-notify.service \
     /etc/systemd/system/nvidia-powerd.service.d/px13-nvpcf.conf \
     /etc/dbus-1/system.d/org.asuslinux.Px13Power.conf \
     /etc/dbus-1/system.d/org.asuslinux.TuningProvider.conf \

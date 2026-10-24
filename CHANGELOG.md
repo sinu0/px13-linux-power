@@ -43,6 +43,11 @@
 - An empty gauge counts as critical even when `capacity_level` still reads
   "Low": the PX13 reports 0 Wh at that level, so the watch saw no drain and
   the rescue never armed.
+- On USB-C the drain warning asks for a re-plug: a USB-C reset the embedded
+  controller does not see as an unplug leaves the input off while the
+  firmware reports "Charging".
+- New `px13-notify` user service shows controller warnings, such as a
+  battery draining on external power, as desktop notifications.
 - Quiet Gaming lowers the EPP to `power` on battery: asusd often selects the
   quiet mode on battery, where gaming tuning only drained it faster.
 - The battery balance no longer goes blind on an empty battery: the gauge

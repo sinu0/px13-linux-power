@@ -210,6 +210,13 @@ limiting the USB-C input; a reboot cleared the throttling, but only an EC
 reset (power off, unplug, hold the power button for 30-40 s) restored
 charging. See [`docs/FINDINGS.md`](docs/FINDINGS.md).
 
+A USB-C charger can also get stuck with its input off while the firmware
+reports "Charging": a USB-C reset that the embedded controller does not see
+as an unplug leaves the laptop running from the battery. A re-plug restores
+charging, so on USB-C the warning asks for one. The `px13-notify` user
+service shows the warning, and any other controller error, as a desktop
+notification.
+
 `px13ctl state` reports the measurement under `battery` (`net_w`,
 `draining`, `critical`) and the controller under `battery_balance`
 (`level_percent`, `cpu_spl_w`, `gpu_clock_limit_mhz`) and reports the detected power source under `power_source`

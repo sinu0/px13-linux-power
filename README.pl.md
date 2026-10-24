@@ -192,6 +192,13 @@ przywrócił dopiero reset EC (wyłączenie, odłączenie zasilania, przytrzyman
 przycisku zasilania przez 30-40 s). Szczegóły w
 [`docs/FINDINGS.md`](docs/FINDINGS.md).
 
+Ładowarka USB-C może też utknąć z wyłączonym wejściem, choć firmware zgłasza
+„Charging”: reset połączenia USB-C, którego kontroler EC nie odczyta jako
+odłączenia, zostawia laptopa na baterii. Ładowanie przywraca przepięcie
+ładowarki, więc na USB-C ostrzeżenie o to prosi. Usługa użytkownika
+`px13-notify` pokazuje to ostrzeżenie, jak i każdy inny błąd kontrolera, jako
+powiadomienie na pulpicie.
+
 `px13ctl state` pokazuje pomiar pod kluczem `battery` (`net_w`, `draining`,
 `critical`), a regulator pod `battery_balance` (`level_percent`,
 `cpu_spl_w`, `gpu_clock_limit_mhz`) oraz wykryte źródło zasilania pod `power_source`

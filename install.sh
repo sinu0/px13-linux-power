@@ -135,13 +135,16 @@ done
 # The 0.1 layout installed a single script; replace the whole directory.
 rm -rf "$LIB_DIR"
 install -d -m 0755 "$LIB_DIR/px13power" "$LIB_DIR/models" /etc/px13-powerd/profiles.d \
-    /etc/systemd/system/nvidia-powerd.service.d
-install -m 0755 "$ROOT/daemon/px13_powerd.py" "$ROOT/daemon/px13_benchmark.py" "$LIB_DIR/"
+    /etc/systemd/system/nvidia-powerd.service.d /etc/systemd/user
+install -m 0755 "$ROOT/daemon/px13_powerd.py" "$ROOT/daemon/px13_notify.py" \
+    "$ROOT/daemon/px13_benchmark.py" "$LIB_DIR/"
 install -m 0644 "$ROOT"/daemon/px13power/*.py "$LIB_DIR/px13power/"
 install -m 0644 "$ROOT"/daemon/models/*.toml "$LIB_DIR/models/"
 install -m 0755 "$ROOT/daemon/px13ctl.py" /usr/local/bin/px13ctl
 install -m 0644 "$ROOT/daemon/px13-powerd.service" \
     /etc/systemd/system/px13-powerd.service
+install -m 0644 "$ROOT/daemon/px13-notify.service" \
+    /etc/systemd/user/px13-notify.service
 rm -f /etc/dbus-1/system.d/org.asuslinux.Px13Power.conf
 install -m 0644 "$ROOT/daemon/px13-powerd.conf" \
     /etc/dbus-1/system.d/org.asuslinux.TuningProvider.conf
@@ -175,6 +178,7 @@ systemctl enable nvidia-powerd.service >/dev/null 2>&1 || true
 systemctl start nvidia-powerd.service
 systemctl start asusd.service
 systemctl enable --now px13-powerd.service
+systemctl --global enable px13-notify.service >/dev/null
 systemctl is-active --quiet asusd.service || die "asusd failed to start"
 systemctl is-active --quiet nvidia-powerd.service || die "nvidia-powerd failed to start"
 systemctl is-active --quiet px13-powerd.service || die "px13-powerd failed to start"
@@ -182,6 +186,7 @@ systemctl is-active --quiet px13-powerd.service || die "px13-powerd failed to st
 SUCCESS=1
 printf 'PX13 Linux Power %s installed. Limits follow the platform profile (Fn+F5).\n' "$PROJECT_VERSION"
 printf 'Run: px13ctl state; sudo ./scripts/doctor.sh\n'
+printf 'Desktop notifications start at the next login, or now: systemctl --user start px13-notify\n'
 printf 'Personal profiles: see examples/profiles.d and /etc/px13-powerd/profiles.d.\n'
 if ! grep -q '^DynamicPowerManagement: 2$' /proc/driver/nvidia/params 2>/dev/null; then
     printf 'RTD3 config installed to /etc/modprobe.d/px13-nvidia-rtd3.conf.\n'

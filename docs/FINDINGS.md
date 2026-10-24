@@ -226,3 +226,36 @@ Re-tested on kernel `7.3.0-rc1` (CachyOS), NVIDIA `610.57.04`, `asusctl`
 - The daemon now runs Quiet Gaming with EPP `power` on battery, follows the
   battery voltage trend while the gauge reads empty, and reports when the
   battery drains even at the lowest limits on external power.
+
+## 2026-10 stuck USB-C input
+
+- Twice, a USB-C charger (150 W, about 100 W PD) plugged into the running
+  laptop after time on battery left the firmware reporting `AC0` online and
+  `Charging` while the battery supplied the load. Once it started at 45 %, so
+  a deep discharge is not needed. One of the two ran the battery down until
+  the laptop shut down. Plugged into the powered-off laptop, or re-plugged at
+  idle, the same charger and cable charged at about +70 W. The 200 W barrel
+  adapter never showed it.
+- Reproduced on demand. A UCSI `CONNECTOR_RESET` of the charger's connector
+  (`echo 0x20003 > /sys/kernel/debug/usb/ucsi/USBC000:00/command`, a hard
+  reset on UCSI before 2.0) dropped VBUS briefly: the battery voltage fell by
+  0.5 V, yet `AC0` never went offline. From then on the battery supplied the
+  whole load, about 15 W (53.89 → 53.73 Wh in 36 s), while the UCSI supply
+  still reported a PD contract at 5 A and the battery reported `Charging`.
+  A second reset did not help; a physical re-plug, which the embedded
+  controller does see as an unplug, restored charging at once.
+- Likely trigger in normal use: a charger that hard-resets the PD contract
+  on overload. Plugging in under load with a low battery asks for the system
+  load plus the full charge current, which can exceed 100 W. This is not
+  confirmed: the contract cannot be read (below).
+- So resetting the port is not a fix, and the daemon must never do it. On
+  USB-C the drain warning asks for a re-plug, and `px13-notify` shows it on
+  the desktop.
+- The UCSI debugfs read commands (`GET_PDOS`, `GET_CONNECTOR_STATUS`, ...)
+  fail with `EINVAL` on Linux 7.3: commit `d9dc19910321` grew the debugfs
+  response buffer to 24 bytes and requests that size, above the 16-byte
+  limit of UCSI before 2.0, which `ucsi_run_command()` rejects. The charger's
+  PDOs and the chosen voltage therefore cannot be read; the UCSI supply's
+  `current_now` is the RDO operating current only.
+- The gauge read 0 Wh while `capacity_level` still said `Low`; the battery
+  watch now treats 0 Wh as critical so the rescue arms.

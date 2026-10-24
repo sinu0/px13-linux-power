@@ -20,6 +20,7 @@ from px13power.balance import BatteryBalance  # noqa: E402
 from px13power.battery import BatteryMonitor  # noqa: E402
 from px13power.controller import Controller, RequestError  # noqa: E402
 from px13power.nvidia import nvpcf_policy  # noqa: E402
+from px13_notify import Notifier  # noqa: E402
 
 MODELS = ROOT / "daemon" / "models"
 EXAMPLE = ROOT / "examples" / "profiles.d" / "120w.toml"
@@ -566,8 +567,16 @@ class TuningTest(Fixture):
         self.sysfs.set_source("usb-c")  # Safe, no battery balance
         self.drain(12)
         self.assertIn("charger does not cover the load", self.controller.state()["last_error"])
+        self.assertIn("re-plug the USB-C charger", self.controller.state()["last_error"])
         self.drain(-30)
         self.assertEqual(self.controller.state()["last_error"], "")
+
+    def test_weak_adapter_gets_no_usb_c_hint(self):
+        self.drain(12)
+        self.assertEqual(
+            self.controller.state()["last_error"],
+            "The battery drains on external power: the charger does not cover the load",
+        )
 
     def test_battery_balance_gets_its_chance_first(self):
         self.sysfs.set_source("usb-c")
@@ -653,6 +662,23 @@ class SmallVbiosTest(Fixture):
         self.controller.confirm_cooling()
         self.controller.wait_idle()
         self.assertEqual(self.controller.profile, "Gaming")
+
+
+class NotifierTest(unittest.TestCase):
+    def test_shows_each_new_error_once_and_withdraws_it(self):
+        shown, closed = [], []
+        notifier = Notifier(
+            show=lambda message, replaces: shown.append((message, replaces)) or len(shown),
+            close=closed.append,
+        )
+        notifier.update({"last_error": ""})
+        notifier.update({"last_error": "drains"})
+        notifier.update({"last_error": "drains"})  # other state changes
+        notifier.update({"last_error": "drains. Re-plug"})
+        self.assertEqual(shown, [("drains", 0), ("drains. Re-plug", 1)])
+        notifier.update({"last_error": ""})
+        notifier.update({"last_error": ""})
+        self.assertEqual(closed, [2])
 
 
 if __name__ == "__main__":
