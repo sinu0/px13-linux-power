@@ -78,8 +78,8 @@ class Sysfs:
     def set_mode(self, mode):
         write(self.platform_profile, mode)
 
-    def set_critical(self, critical):
-        write(self.supplies / "BAT0" / "capacity_level", "Critical" if critical else "Normal")
+    def set_critical(self, critical, level="Critical"):
+        write(self.supplies / "BAT0" / "capacity_level", level if critical else "Normal")
         if critical:
             self.set_energy(0)
 
@@ -270,6 +270,8 @@ class HardwareTest(unittest.TestCase):
             battery = supplies.battery()
             self.assertEqual((battery.energy_wh, battery.voltage_v), (50.0, 15.8))  # not the stylus
             self.assertFalse(battery.full or battery.critical)
+            sysfs.set_critical(True, level="Low")
+            self.assertTrue(supplies.battery().critical)
             sysfs.set_lid(False)
             self.assertFalse(hardware.lid_open(sysfs.lids))
             self.assertTrue(hardware.lid_open(Path(tmp) / "no-lid"))
@@ -535,9 +537,9 @@ class TuningTest(Fixture):
         self.tick()
         self.assertEqual(self.hw.cpu.epp, "balance_performance")
 
-    def empty_battery(self, volts_per_second, seconds=25):
+    def empty_battery(self, volts_per_second, seconds=25, level="Critical"):
         """Runs with an empty gauge, continuing from the current voltage."""
-        self.sysfs.set_critical(True)
+        self.sysfs.set_critical(True, level)
         for _ in range(seconds):
             self.volts += volts_per_second
             self.sysfs.set_voltage(self.volts)
@@ -580,6 +582,11 @@ class TuningTest(Fixture):
         self.empty_battery(-0.001, seconds=30)
         self.assertEqual(self.sleeps, ["suspend"])
         self.empty_battery(-0.001, seconds=90)
+        self.assertEqual(self.sleeps, ["suspend"])
+
+    def test_rescue_when_the_empty_gauge_reports_low(self):
+        self.sysfs.set_source("usb-c")
+        self.empty_battery(-0.003, seconds=90, level="Low")
         self.assertEqual(self.sleeps, ["suspend"])
 
     def test_no_rescue_while_the_empty_battery_charges(self):

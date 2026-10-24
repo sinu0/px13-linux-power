@@ -127,7 +127,8 @@ class PowerSupplies:
             energy_wh=None if energy is None else energy / 1_000_000,
             voltage_v=None if voltage is None else voltage / 1_000_000,
             full=read_text(battery / "status") in {"Full", "Not charging"},
-            critical=read_text(battery / "capacity_level") == "Critical",
+            # The PX13 gauge can read 0 Wh while capacity_level still says "Low".
+            critical=read_text(battery / "capacity_level") == "Critical" or energy == 0,
         )
 
 

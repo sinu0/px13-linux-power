@@ -40,6 +40,9 @@
   the system, or suspends it when hibernation is not set up, because the
   desktop's own low-battery action never triggers while the firmware reports
   "Charging".
+- An empty gauge counts as critical even when `capacity_level` still reads
+  "Low": the PX13 reports 0 Wh at that level, so the watch saw no drain and
+  the rescue never armed.
 - Quiet Gaming lowers the EPP to `power` on battery: asusd often selects the
   quiet mode on battery, where gaming tuning only drained it faster.
 - The battery balance no longer goes blind on an empty battery: the gauge
